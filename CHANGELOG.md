@@ -12,6 +12,10 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 - Android (Godot, Flutter, Kotlin, React Native): statically linked OpenCL and Vulkan backends with automatic OpenCL → Vulkan → CPU selection. The embedded ICD loader allows inference when the vendor OpenCL driver is absent. Vision/audio projection remains on CPU.
 
+### Changed
+
+- Updated llama.cpp from b10200 to b11074 (2026-09-21). Among other things this brings the OpenCL backend fixes for Qualcomm Adreno 7xx (Snapdragon 8 Gen 3): out-of-bounds reads in the Adreno image kernels, wrong results for unaligned K-quant weights, several aborts, and the K-quant lm_head is kept on the CPU on that generation to work around a driver compiler issue.
+
 ### Fixed
 
 - Android (Kotlin, Flutter, React Native, Godot): OpenCL now works on Qualcomm Adreno. Qualcomm's public `libOpenCL.so` is itself an ICD loader, which the embedded Khronos loader rejected, so Adreno devices silently fell back to Vulkan or CPU. The loader patch now enumerates such a library through `clGetPlatformIDs`.
