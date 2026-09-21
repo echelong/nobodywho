@@ -48,6 +48,9 @@ jobs:
         with:
           target: aarch64-linux-android
           ndk: ${{ steps.ndk.outputs.ndk-path }}
+      - name: Test shim forwarding and missing-driver handling
+        run: bash nobodywho/android/tests/test-opencl-shim.sh
+
       - name: Build diagnostic APKs
         env:
           ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}

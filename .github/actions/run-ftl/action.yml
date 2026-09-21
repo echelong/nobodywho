@@ -148,6 +148,6 @@ runs:
         }
         run_tests "$FTL_SCENARIO"
         if [[ "${{ inputs.test-missing-opencl }}" == true ]]; then
-          # A separate instrumentation run gives the ICD loader a fresh process.
+          # A separate instrumentation run gives driver loading a fresh process.
           run_tests missing-opencl --environment-variables withoutOpencl=true
         fi

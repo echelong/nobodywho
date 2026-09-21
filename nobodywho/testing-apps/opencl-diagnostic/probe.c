@@ -80,7 +80,12 @@ JNIEXPORT jboolean JNICALL Java_ai_nobodywho_opencl_Probe_run(JNIEnv *env, jclas
         err = SENTINEL;
         child = p_clCreateSubBuffer(parent, CL_MEM_READ_WRITE, CL_BUFFER_CREATE_TYPE_REGION, &region, &err);
         LOG("subbuffer=%p origin=%zu size=%zu err=%d sentinel=%d", (void *)child, region.origin, region.size, err, SENTINEL);
-        if (!child || err != CL_SUCCESS) goto cleanup;
+        if (!child || err != CL_SUCCESS) {
+            // An ABI mismatch can return an integer error as a bogus handle.
+            // Never pass an unsuccessfully created child to the release API.
+            child = NULL;
+            goto cleanup;
+        }
         size_t actual_size = 0;
         CHECK(p_clGetMemObjectInfo(child, CL_MEM_SIZE, sizeof(actual_size), &actual_size, NULL));
         if (actual_size != size) { LOG("unexpected size=%zu", actual_size); goto cleanup; }

@@ -3,7 +3,7 @@
 From a pushed branch, use the existing Mobile Device Tests workflow:
 
 ```sh
-gh workflow run mobile-device-tests.yml --ref YOUR_BRANCH -f jobs=opencl-diagnostic -f device=s24ultra-adreno
+gh workflow run mobile-device-tests.yml --ref YOUR_BRANCH -f jobs=opencl-diagnostic -f device=both
 ```
 
 Once the new workflow is on the default branch, you can also use
@@ -11,9 +11,11 @@ Once the new workflow is on the default branch, you can also use
 
 The direct and embedded variants run in separate Firebase Test Lab invocations.
 Neither loads NobodyWho or downloads a model. The embedded variant links the
-same patched static ICD loader as production; the direct variant resolves
+same static forwarding shim as production; the direct variant resolves
 functions from the device's public `libOpenCL.so` with `dlopen`/`dlsym`.
 Both run inside an APK with the same optional native-library declaration.
+`device=both` checks Adreno and Mali. The `embedded` mode name is retained
+so results can be compared with earlier ICD-loader runs.
 
 In each FTL result's logcat, search for `OpenCLProbe`. Logs include device,
 driver, alignment, handles, region sizes and error codes. `-99999` means the

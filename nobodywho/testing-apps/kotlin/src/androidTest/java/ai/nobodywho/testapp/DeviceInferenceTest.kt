@@ -42,12 +42,10 @@ class DeviceInferenceTest {
 
     @Test
     fun chatCompletesStreamsAndCallsTools() = runBlocking {
-        // Configure before the first native call: ICD discovery is cached for
+        // Configure before the first native call: driver loading is cached for
         // the lifetime of the process. CI runs this scenario in a fresh process.
         if (InstrumentationRegistry.getArguments().getString("withoutOpencl") == "true") {
-            Os.setenv("OCL_ICD_FILENAMES", "libnobodywho_missing_opencl_driver.so", true)
-            val context = InstrumentationRegistry.getInstrumentation().targetContext
-            Os.setenv("OCL_ICD_VENDORS", "${context.cacheDir}/missing-icd-vendors", true)
+            Os.setenv("NOBODYWHO_OPENCL_LIBRARY", "libnobodywho_missing_opencl_driver.so", true)
         }
         // Select OpenCL/Vulkan if available, or fall back to CPU.
         val model = Model.load(modelUrl(), useGpu = true)
