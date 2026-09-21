@@ -49,14 +49,14 @@ pub(crate) fn backend_devices() -> Vec<llama_cpp_2::LlamaBackendDevice> {
     llama_cpp_2::list_llama_ggml_backend_devices()
 }
 
-/// Avoid the observed Adreno Q4_K shader abort (llama.cpp#12421), except Turnip.
+/// Avoid Adreno OpenCL buffer and proprietary Vulkan shader aborts; allow Turnip.
 fn is_unusable_android_gpu(device: &llama_cpp_2::LlamaBackendDevice) -> bool {
-    if device.backend != "Vulkan" {
+    if !matches!(device.backend.as_str(), "OpenCL" | "Vulkan") {
         return false;
     }
-    let ident = format!("{} {}", device.description, device.name);
-    let qualcomm = ident.contains("Adreno") || ident.contains("Qualcomm");
-    qualcomm && !ident.contains("Turnip")
+    let ident = format!("{} {}", device.description, device.name).to_ascii_lowercase();
+    let qualcomm = ident.contains("adreno") || ident.contains("qualcomm");
+    qualcomm && !(device.backend == "Vulkan" && ident.contains("turnip"))
 }
 
 pub(crate) fn select_best_gpu() -> Option<llama_cpp_2::LlamaBackendDevice> {
@@ -79,7 +79,7 @@ fn usable_gpus(
         .filter(move |d| {
             let skip = prefer_android_backends && is_unusable_android_gpu(d);
             if skip {
-                warn!(device = %d.description, "Skipping Adreno Vulkan shader failure; using OpenCL or CPU");
+                warn!(backend = %d.backend, device = %d.description, "Skipping Adreno backend due to native crashes; selecting another GPU or CPU");
             }
             !skip
         })
@@ -374,7 +374,9 @@ mod tests {
             };
         let cpu = device("CPU", "", Cpu, 8);
         let vk = device("Vulkan", "Mali-G715-Immortalis MC11", Gpu, 4);
-        let cl = device("OpenCL", "QUALCOMM Adreno(TM) 750", IntegratedGpu, 2);
+        let cl = device("OpenCL", "Mali-G715", IntegratedGpu, 2);
+        let adreno_cl = device("OpenCL", "QUALCOMM Adreno(TM) 750", IntegratedGpu, 2);
+        let qualcomm_cl = device("OpenCL", "QUALCOMM", IntegratedGpu, 2);
         let adreno = device("Vulkan", "Adreno (TM) 750", IntegratedGpu, 15);
         let turnip = device("Vulkan", "Turnip Adreno (TM) 750", IntegratedGpu, 4);
         // Priority beats enumeration order, GPU type and reported free memory.
@@ -386,9 +388,14 @@ mod tests {
             (vec![&cpu], true, None),
             (vec![], true, None),
             (vec![&cpu, &adreno], true, None),
-            (vec![&cpu, &adreno, &cl], true, Some("OpenCL")),
+            (vec![&cpu, &adreno_cl], true, None),
+            (vec![&cpu, &qualcomm_cl], true, None),
+            (vec![&cpu, &adreno, &adreno_cl], true, None),
+            (vec![&adreno_cl, &vk], true, Some("Vulkan")),
+            (vec![&adreno, &cl], true, Some("OpenCL")),
             (vec![&cpu, &turnip], true, Some("Vulkan")),
             (vec![&cpu, &adreno], false, Some("Vulkan")),
+            (vec![&cpu, &adreno_cl], false, Some("OpenCL")),
         ] {
             let devices = devices.into_iter().cloned().collect();
             let selected = select_gpu_from(devices, android);
