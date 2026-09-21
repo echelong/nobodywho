@@ -6,6 +6,9 @@ description: >
   place.
 
 inputs:
+  scenario:
+    description: "Results subdirectory (separates diagnostic matrix entries)"
+    default: "normal"
   app-apk:
     description: "Path to the app APK"
     required: true
@@ -109,8 +112,11 @@ runs:
 
     - name: "Run instrumentation tests on Firebase Test Lab"
       shell: bash
+      env:
+        FTL_SCENARIO: ${{ inputs.scenario }}
       run: |
         set -euo pipefail
+        [[ "$FTL_SCENARIO" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "Invalid scenario" >&2; exit 1; }
         # Explicit "both", not a fallthrough default — a typo in $devices would
         # otherwise silently run on both devices instead of failing fast.
         case "${{ inputs.devices }}" in
@@ -140,7 +146,7 @@ runs:
           --results-dir "$RESULTS_DIR/$scenario" \
           --timeout "${{ inputs.test-timeout }}" "$@"
         }
-        run_tests normal
+        run_tests "$FTL_SCENARIO"
         if [[ "${{ inputs.test-missing-opencl }}" == true ]]; then
           # A separate instrumentation run gives the ICD loader a fresh process.
           run_tests missing-opencl --environment-variables withoutOpencl=true

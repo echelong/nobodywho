@@ -49,14 +49,14 @@ pub(crate) fn backend_devices() -> Vec<llama_cpp_2::LlamaBackendDevice> {
     llama_cpp_2::list_llama_ggml_backend_devices()
 }
 
-/// Avoid Adreno OpenCL buffer and proprietary Vulkan shader aborts; allow Turnip.
+/// Avoid proprietary Adreno Vulkan shader aborts; allow OpenCL and Turnip.
 fn is_unusable_android_gpu(device: &llama_cpp_2::LlamaBackendDevice) -> bool {
-    if !matches!(device.backend.as_str(), "OpenCL" | "Vulkan") {
+    if device.backend != "Vulkan" {
         return false;
     }
     let ident = format!("{} {}", device.description, device.name).to_ascii_lowercase();
     let qualcomm = ident.contains("adreno") || ident.contains("qualcomm");
-    qualcomm && !(device.backend == "Vulkan" && ident.contains("turnip"))
+    qualcomm && !ident.contains("turnip")
 }
 
 pub(crate) fn select_best_gpu() -> Option<llama_cpp_2::LlamaBackendDevice> {
@@ -79,7 +79,7 @@ fn usable_gpus(
         .filter(move |d| {
             let skip = prefer_android_backends && is_unusable_android_gpu(d);
             if skip {
-                warn!(backend = %d.backend, device = %d.description, "Skipping Adreno backend due to native crashes; selecting another GPU or CPU");
+                warn!(device = %d.description, "Skipping Adreno Vulkan shader failure; using OpenCL or CPU");
             }
             !skip
         })
@@ -388,10 +388,10 @@ mod tests {
             (vec![&cpu], true, None),
             (vec![], true, None),
             (vec![&cpu, &adreno], true, None),
-            (vec![&cpu, &adreno_cl], true, None),
-            (vec![&cpu, &qualcomm_cl], true, None),
-            (vec![&cpu, &adreno, &adreno_cl], true, None),
-            (vec![&adreno_cl, &vk], true, Some("Vulkan")),
+            (vec![&cpu, &adreno_cl], true, Some("OpenCL")),
+            (vec![&cpu, &qualcomm_cl], true, Some("OpenCL")),
+            (vec![&cpu, &adreno, &adreno_cl], true, Some("OpenCL")),
+            (vec![&adreno_cl, &vk], true, Some("OpenCL")),
             (vec![&adreno, &cl], true, Some("OpenCL")),
             (vec![&cpu, &turnip], true, Some("Vulkan")),
             (vec![&cpu, &adreno], false, Some("Vulkan")),

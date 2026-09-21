@@ -18,8 +18,8 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ### Fixed
 
-- Android (Kotlin, Flutter, React Native, Godot): Qualcomm Adreno OpenCL and proprietary Vulkan are excluded from inference selection to avoid native model-loading and shader crashes. These devices fall back to CPU; Turnip Vulkan remains eligible. Other GPUs and non-Android platforms are unchanged.
-- Android: the embedded OpenCL loader now discovers Qualcomm's public `libOpenCL.so` through `clGetPlatformIDs`. Discovery remains available for diagnostics, but Adreno OpenCL is excluded from inference selection. ICD tracing is enabled unless the host overrides it.
+- Android (Kotlin, Flutter, React Native, Godot): proprietary Adreno Vulkan is excluded from inference selection to avoid shader crashes. Adreno OpenCL and Turnip Vulkan remain eligible; CPU is used when no eligible GPU is available.
+- Android: the embedded OpenCL loader now discovers Qualcomm's public `libOpenCL.so` through `clGetPlatformIDs`. ICD tracing is enabled unless the host overrides it.
 - Flutter, Kotlin: llama.cpp/ggml native log lines (model loader, backend selection, GPU driver errors) now reach the app's logging. They were silently dropped before because they bypassed the `tracing` → `log` bridge. On Android the library also captures native stdout/stderr, so e.g. Vulkan shader-compilation failures are logged instead of lost.
 - Text a model writes before a tool call is now kept in the chat history. Previously whatever a model generated (and streamed) before the tool call was forgotten and not visible in `get_chat_history()`. It is now stored as content in the assistant message and is rendered next to the tool call. Note that the tool call is still stored in history as the function name and its arguments. Affects all bindings.
 

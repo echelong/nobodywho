@@ -41,6 +41,7 @@ on:
           - flutter-released
           - react-native-source
           - react-native-released
+          - opencl-diagnostic  # explicit only; excluded from all/source/released
       device:
         description: "Which device(s) to run on"
         type: choice
@@ -79,6 +80,13 @@ permissions:
   id-token: write   # required for Workload Identity Federation
 
 jobs:
+  opencl-diagnostic:
+    if: inputs.jobs == 'opencl-diagnostic'
+    uses: ./.github/workflows/opencl-diagnostic.yml
+    with:
+      device: ${{ inputs.device || 's24ultra-adreno' }}
+    secrets: inherit
+
   # Resolves the `jobs` input into one boolean per job, so each job carries a
   # plain condition instead of repeating the selection logic six times.
   select:
@@ -364,11 +372,13 @@ jobs:
         run: cargo build -p nobodywho-flutter --target aarch64-linux-android --release --locked
         env:
           ANDROID_NDK: "${{ steps.setup-ndk.outputs.ndk-path }}"
+          # Keep CMake, native compilation and final linking on the same API.
+          ANDROID_API_LEVEL: "28"
           ORT_CXX_STDLIB: "c++_static"
-          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
+          CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
           CARGO_TARGET_AARCH64_LINUX_ANDROID_AR: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-          CC_aarch64_linux_android: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang"
-          CXX_aarch64_linux_android: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang++"
+          CC_aarch64_linux_android: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang"
+          CXX_aarch64_linux_android: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android28-clang++"
           AR_aarch64_linux_android: "${{ steps.setup-ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 
       - name: "Setup JDK"
