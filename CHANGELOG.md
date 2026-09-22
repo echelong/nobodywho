@@ -10,16 +10,15 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ### Added
 
-- Android (Godot, Flutter, Kotlin, React Native): statically linked OpenCL and Vulkan backends with automatic OpenCL → Vulkan → CPU selection. The embedded forwarding shim allows inference when the vendor OpenCL driver is absent. Vision/audio projection remains on CPU.
+- Android (Godot, Flutter, Kotlin, React Native): static OpenCL and Vulkan backends with automatic OpenCL → Vulkan → CPU selection. OpenCL remains optional through an embedded forwarding shim.
 
 ### Changed
 
-- Updated llama.cpp from b10200 to b11074 (2026-09-21). Among other things this brings the OpenCL backend fixes for Qualcomm Adreno 7xx (Snapdragon 8 Gen 3): out-of-bounds reads in the Adreno image kernels, wrong results for unaligned K-quant weights, several aborts, and the K-quant lm_head is kept on the CPU on that generation to work around a driver compiler issue.
+- Updated llama.cpp from b10200 to b11074 (2026-09-21), including Qualcomm Adreno 7xx OpenCL fixes.
 
 ### Fixed
 
-- Android (Kotlin, Flutter, React Native, Godot): proprietary Adreno Vulkan is excluded from inference selection to avoid shader crashes. Adreno OpenCL and Turnip Vulkan remain eligible; CPU is used when no eligible GPU is available.
-- Android (Godot, Flutter, Kotlin, React Native): OpenCL calls now resolve by name through the device's public `libOpenCL.so`, avoiding incompatible vendor ICD dispatch tables. Missing drivers or required functions leave OpenCL unavailable for fallback selection.
+- Android: avoid proprietary Adreno Vulkan shader crashes and incompatible vendor ICD dispatch tables. Adreno OpenCL and Turnip Vulkan remain eligible.
 - Text a model writes before a tool call is now kept in the chat history. Previously whatever a model generated (and streamed) before the tool call was forgotten and not visible in `get_chat_history()`. It is now stored as content in the assistant message and is rendered next to the tool call. Note that the tool call is still stored in history as the function name and its arguments. Affects all bindings.
 
 
