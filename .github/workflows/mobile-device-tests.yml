@@ -41,7 +41,6 @@ on:
           - flutter-released
           - react-native-source
           - react-native-released
-          - opencl-diagnostic  # explicit only; excluded from all/source/released
       device:
         description: "Which device(s) to run on"
         type: choice
@@ -80,13 +79,6 @@ permissions:
   id-token: write   # required for Workload Identity Federation
 
 jobs:
-  opencl-diagnostic:
-    if: inputs.jobs == 'opencl-diagnostic'
-    uses: ./.github/workflows/opencl-diagnostic.yml
-    with:
-      device: ${{ inputs.device || 's24ultra-adreno' }}
-    secrets: inherit
-
   # Resolves the `jobs` input into one boolean per job, so each job carries a
   # plain condition instead of repeating the selection logic six times.
   select:
@@ -236,7 +228,6 @@ jobs:
           app-apk: ${{ steps.apks.outputs.app }}
           test-apk: ${{ steps.apks.outputs.test }}
           native-lib: libnobodywho_uniffi.so
-          test-missing-opencl: "true"
           devices: ${{ inputs.device || 'both' }}
           test-timeout: ${{ inputs.test_timeout || '30m' }}
           project-id: ${{ vars.GCP_PROJECT_ID }}

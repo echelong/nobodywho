@@ -1908,11 +1908,11 @@ pub fn frb_internal_logging_setup_dart_logging_output() -> bool {
 
 #[flutter_rust_bridge::frb(init)]
 pub fn init_app() {
-    // Include llama.cpp's direct tracing events in FRB's log stream.
-    nobodywho::logging::forward_to_log();
+    // send llamacpp logs into tracing
+    nobodywho::send_llamacpp_logs_to_tracing();
 
-    #[cfg(target_os = "android")]
-    nobodywho::logging::capture_native_stdio();
+    // NOTE: Do not set up a `tracing-subscriber`, that will conflict with
+    // `enable_frb_rust_to_dart_logging!` above!
 
     flutter_rust_bridge::setup_backtrace();
 }

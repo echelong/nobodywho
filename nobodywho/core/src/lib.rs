@@ -8,7 +8,6 @@ mod host_memory;
 pub mod huggingface;
 pub mod inference;
 pub mod llm;
-pub mod logging;
 pub mod memory;
 mod model_selection;
 pub mod onnx;

@@ -5,7 +5,6 @@ import ai.nobodywho.Message
 import ai.nobodywho.Model
 import ai.nobodywho.Tool
 import ai.nobodywho.text
-import android.system.Os
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import kotlinx.coroutines.flow.toList
@@ -42,11 +41,6 @@ class DeviceInferenceTest {
 
     @Test
     fun chatCompletesStreamsAndCallsTools() = runBlocking {
-        // Configure before the first native call: driver loading is cached for
-        // the lifetime of the process. CI runs this scenario in a fresh process.
-        if (InstrumentationRegistry.getArguments().getString("withoutOpencl") == "true") {
-            Os.setenv("NOBODYWHO_OPENCL_LIBRARY", "libnobodywho_missing_opencl_driver.so", true)
-        }
         // Select OpenCL/Vulkan if available, or fall back to CPU.
         val model = Model.load(modelUrl(), useGpu = true)
 
@@ -78,13 +72,5 @@ class DeviceInferenceTest {
         val toolResponse = chat.getChatHistory().firstOrNull { it is Message.Tool }
         assertNotNull("Expected a tool response in chat history", toolResponse)
         assertEquals("pong", (toolResponse as Message.Tool).content.text)
-
-        // Also exercise explicit CPU mode in the same packaged library.
-        val cpuChat = Chat(
-            model = Model.load(modelUrl(), useGpu = false),
-            systemPrompt = "Reply with one word only.",
-            templateVariables = mapOf("enable_thinking" to false),
-        )
-        assertFalse("CPU completion should be non-empty", cpuChat.ask("Say hello").completed().isEmpty())
     }
 }
