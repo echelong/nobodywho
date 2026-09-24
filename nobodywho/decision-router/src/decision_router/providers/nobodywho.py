@@ -126,12 +126,14 @@ class PersistentWorker:
         runtime_dir: Path,
         idle_timeout_s: float = 900,
         start_timeout_s: float = 15,
+        name: str = "local-worker",
     ) -> None:
         self.python = python
+        self.name = name
         self.runtime_dir = Path(runtime_dir)
-        self.socket_path = self.runtime_dir / "local-worker.sock"
-        self.pid_path = self.runtime_dir / "local-worker.pid"
-        self.lock_path = self.runtime_dir / "local-worker.lock"
+        self.socket_path = self.runtime_dir / f"{name}.sock"
+        self.pid_path = self.runtime_dir / f"{name}.pid"
+        self.lock_path = self.runtime_dir / f"{name}.lock"
         self.idle_timeout_s = float(idle_timeout_s)
         self.start_timeout_s = float(start_timeout_s)
 
@@ -256,7 +258,20 @@ class NobodyWhoProvider:
 
     @classmethod
     def from_config(cls, config: dict[str, Any], **kwargs: Any) -> NobodyWhoProvider:
-        local = config["local"]
+        """The provider for `local` mode (and shadow/compare)."""
+        return cls.from_settings(config["local"], **kwargs)
+
+    @classmethod
+    def for_tier(cls, config: dict[str, Any], tier: str, **kwargs: Any) -> NobodyWhoProvider:
+        """The provider for one local-first tier, with its own worker."""
+        return cls.from_settings(
+            cfg.tier_settings(config, tier), worker_name=f"tier{tier}-worker", **kwargs
+        )
+
+    @classmethod
+    def from_settings(
+        cls, local: dict[str, Any], worker_name: str = "local-worker", **kwargs: Any
+    ) -> NobodyWhoProvider:
         path = local.get("model_path")
         info = local.get("model_info")
         # Identity recorded by `decision local pull`; ignored if the path was changed since.
@@ -267,7 +282,7 @@ class NobodyWhoProvider:
         python = local.get("python") or sys.executable
         if "runner" not in kwargs and local.get("persistent"):
             kwargs["runner"] = PersistentWorker(
-                python, cfg.runtime_dir(), local.get("idle_timeout_s", 900)
+                python, cfg.runtime_dir(), local.get("idle_timeout_s", 900), name=worker_name
             )
         return cls(
             model_path=path,
@@ -294,8 +309,10 @@ class NobodyWhoProvider:
             return False, "local model file not found"
         return True, "ok"
 
-    def decide(self, request: DecisionRequest) -> DecisionResult:
+    def decide(self, request: DecisionRequest, attempt: int = 0) -> DecisionResult:
+        """`attempt` > 0 draws a fresh, still deterministic, set of seeds."""
         started = time.monotonic()
+        seed = self.seed + attempt * self.samples
 
         def elapsed() -> int:
             return round((time.monotonic() - started) * 1000)
@@ -310,7 +327,7 @@ class NobodyWhoProvider:
             "model_name": info.get("name"),
             "quantization": info.get("quantization"),
             "temperature": self.temperature,
-            "seeds": [self.seed + i for i in range(self.samples)],
+            "seeds": [seed + i for i in range(self.samples)],
             "worker": "persistent" if isinstance(self.runner, PersistentWorker) else "oneshot",
         }
         if info.get("sha256"):
@@ -321,7 +338,7 @@ class NobodyWhoProvider:
             "model_path": self.model_path,
             "system_prompt": SYSTEM_PROMPT,
             "grammar": grammar_for(request.allowed()),
-            "samples": plan_samples(request, self.samples, self.seed),
+            "samples": plan_samples(request, self.samples, seed),
             "temperature": self.temperature,
             "n_ctx": self.n_ctx,
             "use_gpu": self.use_gpu,
@@ -351,6 +368,37 @@ class NobodyWhoProvider:
             if key in output:
                 details[key] = output[key]
         return aggregate(request, output.get("outputs"), latency, model, details)
+
+    def run_prompts(
+        self,
+        system_prompt: str,
+        grammar: str,
+        prompts: list[str],
+        temperature: float,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Runs one grammar-constrained completion per prompt on this model's worker.
+
+        Returns the worker output ({"outputs": [...], ...} or {"error", "reason"});
+        raises subprocess.TimeoutExpired on timeout.
+        """
+        ok, why = self.available()
+        if not ok:
+            return {"error": why, "reason": "local_model_unavailable"}
+        job = {
+            "model_path": self.model_path,
+            "system_prompt": system_prompt,
+            "grammar": grammar,
+            "samples": [{"seed": self.seed + i, "prompt": p} for i, p in enumerate(prompts)],
+            "temperature": temperature,
+            "n_ctx": self.n_ctx,
+            "use_gpu": self.use_gpu,
+        }
+        return self.runner(job, self.timeout_s if timeout_s is None else timeout_s)
+
+    @property
+    def model_name(self) -> str | None:
+        return Path(self.model_path).stem if self.model_path else None
 
 
 def aggregate(

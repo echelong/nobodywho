@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-MODES = ("off", "jev", "local", "shadow", "compare")
+MODES = ("off", "jev", "local", "shadow", "compare", "local-first")
 DEFAULT_MODE = "jev"
 
 DEFAULT_LOCAL_MODEL = "huggingface:NobodyWho/Qwen_Qwen3-0.6B-GGUF/Qwen_Qwen3-0.6B-Q4_K_M.gguf"
@@ -28,6 +28,8 @@ DEFAULTS: dict[str, Any] = {
         "model": "jev-latest",
         "key_file": "~/.config/jev/typesafe.key",
         "timeout_s": 20,
+        # Hard switch: when false the router never calls JEV, in any mode.
+        "enabled": True,
     },
     "local": {
         "source": DEFAULT_LOCAL_MODEL,
@@ -43,7 +45,32 @@ DEFAULTS: dict[str, Any] = {
         "persistent": True,
         "idle_timeout_s": 900,
     },
+    # local-first: each tier inherits every "local" setting it does not override.
+    "tiers": {
+        "1": {"label": "tier1"},
+        "2": {"label": "tier2", "idle_timeout_s": 120, "timeout_s": 300},
+    },
+    # When a local tier's answer is good enough to stop escalating.
+    "acceptance": {
+        "min_stability": 0.66,  # winner's vote share (sample_stability, not a probability)
+        "min_margin": 1,  # winner votes minus runner-up votes
+        "escalate_on_abstain": True,
+        "max_local_retries": 0,  # extra attempts per tier with fresh seeds
+    },
+    # `decision prune`: extractive output pruning, local-first like `decision ask`.
+    "prune": {
+        "budget_chars": 12000,
+        "block_lines": 30,
+        "hard_cap_factor": 2.0,
+        "archive": True,  # keep the full output under $XDG_STATE_HOME/decision-router/prune-archive
+        "tier1": {"max_blocks": 24, "timeout_s": 45},
+        "tier2": {"enabled": True, "max_blocks": 8, "timeout_s": 150},
+        "jev_max_blocks": 60,
+    },
 }
+
+TIER_NAMES = ("1", "2")
+MODEL_IDENTITY = ("source", "model_path", "model_sha256", "model_info")
 
 
 def _xdg(var: str, fallback: str) -> Path:
@@ -72,6 +99,10 @@ def runtime_dir() -> Path:
         return Path(override)
     runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
     return Path(runtime) / "decision-router" if runtime else state_dir() / "run"
+
+
+def prune_archive_dir() -> Path:
+    return state_dir() / "prune-archive"
 
 
 def config_path() -> Path:
@@ -111,6 +142,16 @@ def load() -> dict[str, Any]:
     if os.environ.get("JEV_KEY_FILE", "").strip():
         config["jev"]["key_file"] = os.environ["JEV_KEY_FILE"].strip()
     return config
+
+
+def tier_settings(config: dict[str, Any], tier: str) -> dict[str, Any]:
+    """The effective settings of one local-first tier: "local" overlaid with the tier's own.
+
+    The model itself is never inherited: a tier without its own model is unavailable
+    rather than silently running the `local` mode's model.
+    """
+    base = {k: v for k, v in config["local"].items() if k not in MODEL_IDENTITY}
+    return _merge(base, config.get("tiers", {}).get(tier, {}))
 
 
 def mode(config: dict[str, Any]) -> tuple[str, str]:

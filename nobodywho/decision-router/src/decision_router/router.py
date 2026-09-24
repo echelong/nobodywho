@@ -8,8 +8,13 @@ Modes
            answer is recorded but can never become the decision
   compare  both run; the outcome is a comparison, and a disagreement never
            resolves to either provider
+  local-first
+           production mode: tier 1 (local), then tier 2 (larger local), then
+           tier 3 (JEV). A tier runs only when every earlier tier failed the
+           acceptance policy for a reason in acceptance.ESCALATION_REASONS,
+           so JEV stays dormant whenever a local tier answers acceptably.
 
-There is deliberately no automatic local -> JEV escalation.
+`jev.enabled = false` is a hard switch: JEV is never called, in any mode.
 
 The router only advises. It never executes anything, and its failures are
 returned as data (`follow: null`) instead of raised.
@@ -23,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from .acceptance import Policy, judge
 from .config import MODES
 from .contract import DecisionRequest, DecisionResult
 from .ledger import Ledger
@@ -33,6 +39,14 @@ class Provider(Protocol):
     name: str
 
     def decide(self, request: DecisionRequest) -> DecisionResult: ...
+
+
+class TierProvider(Protocol):
+    """A local-first tier: `attempt` > 0 asks for fresh seeds on a retry."""
+
+    name: str
+
+    def decide(self, request: DecisionRequest, attempt: int = 0) -> DecisionResult: ...
 
 
 BYPASS_PHRASES = re.compile(r"(?i)\bbypass\s+(?:the\s+)?(?:decision[\s-]*router|jev)\b")
@@ -97,6 +111,8 @@ class Outcome:
     agreement: bool | None = None
     skipped: str | None = None
     note: str | None = None
+    tier: int | None = None
+    attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -111,6 +127,9 @@ class Outcome:
             data["results"] = {k: v.to_dict() for k, v in self.results.items()}
         if self.mode in ("shadow", "compare"):
             data["agreement"] = self.agreement
+        if self.mode == "local-first":
+            data["tier"] = self.tier
+            data["attempts"] = self.attempts
         if self.skipped:
             data["skipped"] = self.skipped
         if self.note:
@@ -124,10 +143,18 @@ class Router:
         providers: dict[str, Provider],
         ledger: Ledger,
         secret_literals: tuple[str, ...] = (),
+        *,
+        tiers: dict[int, TierProvider] | None = None,
+        policy: Policy | None = None,
+        jev_enabled: bool = True,
     ) -> None:
         self.providers = providers
         self.ledger = ledger
         self.secret_literals = secret_literals
+        self.tiers = tiers or {}
+        self.policy = policy or Policy()
+        self.jev_enabled = jev_enabled
+        self.jev_calls = 0
 
     def route(
         self,
@@ -136,8 +163,10 @@ class Router:
         *,
         bypass: bool = False,
         user_directive: str | None = None,
+        caller: str | None = None,
     ) -> Outcome:
         mode = (mode or "").lower()
+        self.ledger.caller = caller or self.ledger.caller
         skip = self._skip_reason(request, mode, bypass, user_directive)
         request = sanitize_request(request, self.secret_literals)
         if skip:
@@ -154,6 +183,8 @@ class Router:
                 return self._single(request, mode, "nobodywho")
             if mode == "shadow":
                 return self._shadow(request)
+            if mode == "local-first":
+                return self._local_first(request)
             return self._compare(request)
         finally:
             if previous is None:
@@ -182,6 +213,10 @@ class Router:
         return None
 
     def _call(self, name: str, request: DecisionRequest) -> DecisionResult:
+        if name == "jev":
+            if not self.jev_enabled:
+                return DecisionResult.failure("jev", "JEV is disabled", "jev_disabled")
+            self.jev_calls += 1
         provider = self.providers.get(name)
         if provider is None:
             return DecisionResult.failure(name, "provider not configured", f"{name}_unavailable")
@@ -261,6 +296,102 @@ class Router:
             agreement=agreement,
             note=note,
         )
+
+    def _local_first(self, request: DecisionRequest) -> Outcome:
+        """Tier 1, then tier 2, then JEV; stop at the first acceptable answer."""
+        attempts: list[dict[str, Any]] = []
+        receipts: list[dict[str, Any]] = []
+        previous: tuple[str, str] | None = None  # (label, escalation reason)
+
+        def record(tier: int, result: DecisionResult, accepted: bool, why: str | None) -> None:
+            attempt = {
+                "tier": tier,
+                "provider": result.provider,
+                "model": result.model,
+                "choice": result.choice,
+                "abstain": result.abstain,
+                "confidence": result.confidence,
+                "confidence_kind": result.confidence_kind,
+                "latency_ms": result.latency_ms,
+                "accepted": accepted,
+                "escalation_reason": why,
+                "fallback_from": previous[0] if previous else None,
+                "fallback_reason": previous[1] if previous else None,
+            }
+            attempts.append(attempt)
+            receipts.append(
+                self.ledger.receipt(
+                    request, "local-first", f"tier{tier}", result,
+                    tier=tier, accepted=accepted, escalation_reason=why,
+                    fallback_from=attempt["fallback_from"],
+                    fallback_reason=attempt["fallback_reason"],
+                )
+            )  # fmt: skip
+
+        final: DecisionResult | None = None
+        final_tier: int | None = None
+        if not self.tiers:  # never let a misconfiguration turn local-first into JEV-first
+            result = DecisionResult.failure("router", "no local tiers configured", "no_local_tiers")
+            self.ledger.write([self.ledger.receipt(request, "local-first", "none", result)])
+            return Outcome(
+                request.id, "local-first", decision=result, note="no local tiers configured"
+            )
+        for tier in sorted(self.tiers):
+            provider = self.tiers[tier]
+            for attempt in range(1 + self.policy.max_local_retries):
+                result = self._call_tier(provider, request, attempt)
+                accepted, why = judge(result, self.policy)
+                record(tier, result, accepted, why)
+                if accepted:
+                    final, final_tier = result, tier
+                    break
+                if why not in ("stability_below_threshold", "abstain", "no_valid_choice"):
+                    break  # retrying cannot fix a broken or missing model
+            if final is not None:
+                break
+            previous = (f"{result.provider}/{result.model or 'unknown'}", why or "provider_error")
+
+        if final is None:
+            result = self._call("jev", request)
+            accepted = result.ok
+            record(
+                3, result, accepted, None if accepted else (result.fallback_reason or "jev_failed")
+            )
+            if accepted:
+                final, final_tier = result, 3
+            else:
+                final = result
+
+        self.ledger.write(receipts)
+        follow = final.choice if final_tier is not None and final.ok else None
+        if final_tier is None:
+            note = (
+                "no acceptable decision: local tiers escalated and JEV is disabled; "
+                "use your own judgement"
+                if final.fallback_reason == "jev_disabled"
+                else f"no acceptable decision ({final.fallback_reason}); use your own judgement"
+            )
+        elif final.abstain:
+            note = f"tier {final_tier} abstained; use your own judgement"
+        else:
+            note = None
+        return Outcome(
+            request.id, "local-first", follow=follow, decision=final,
+            tier=final_tier, attempts=attempts, note=note,
+        )  # fmt: skip
+
+    def _call_tier(
+        self, provider: TierProvider, request: DecisionRequest, attempt: int = 0
+    ) -> DecisionResult:
+        try:
+            if attempt:  # a retry draws fresh seeds
+                return provider.decide(request, attempt=attempt)
+            return provider.decide(request)
+        except Exception as error:  # noqa: BLE001 - a provider bug must not reach the agent
+            return DecisionResult.failure(
+                provider.name, redact(f"{type(error).__name__}: {error}", self.secret_literals)[:200],
+                "nobodywho_error",
+            )  # fmt: skip
 
 
 def _label(result: DecisionResult) -> str:

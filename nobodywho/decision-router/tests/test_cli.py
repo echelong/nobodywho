@@ -33,11 +33,11 @@ def run(capsys, *argv):
 
 def test_provider_switching(capsys):
     code, out = run(capsys, "provider")
-    assert code == 0 and out.out.startswith("jev")
-    for mode in ("off", "local", "shadow", "compare", "jev"):
+    assert code == 0 and out.out.startswith("mode: jev")
+    for mode in ("off", "local", "shadow", "compare", "local-first", "jev"):
         assert run(capsys, "provider", mode)[0] == 0
         assert json.loads(cfg.config_path().read_text())["mode"] == mode
-        assert run(capsys, "provider")[1].out.startswith(mode)
+        assert run(capsys, "provider")[1].out.startswith(f"mode: {mode} ")
     assert cfg.config_path().stat().st_mode & 0o077 == 0
 
 
@@ -49,7 +49,7 @@ def test_provider_rejects_unknown_mode(capsys):
 def test_env_overrides_mode(capsys, monkeypatch):
     run(capsys, "provider", "jev")
     monkeypatch.setenv("DECISION_ROUTER_MODE", "off")
-    assert run(capsys, "provider")[1].out.startswith("off")
+    assert run(capsys, "provider")[1].out.startswith("mode: off ")
 
 
 def test_ask_in_off_mode_skips(capsys):
