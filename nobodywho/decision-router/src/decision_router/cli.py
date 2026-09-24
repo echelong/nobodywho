@@ -26,6 +26,7 @@ from . import config as cfg
 from .contract import DecisionRequest, RequestError
 from .ledger import Ledger
 from .providers import JevProvider, NobodyWhoProvider
+from .providers.nobodywho import PersistentWorker
 from .router import Router
 
 RULE_NAME = "decision-router.md"
@@ -165,6 +166,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     runtime_ready = _check("runtime", runtime_ok, runtime)
     if local_needed:
         healthy &= runtime_ready
+    print(f"  worker: {_worker_status(config)}")
 
     print("cline:")
     rule = DEFAULT_RULE_DIR / RULE_NAME
@@ -211,6 +213,33 @@ def cmd_ledger(args: argparse.Namespace) -> int:
             f"{record.get('ts')} {record.get('mode')}/{record.get('role')} "
             f"{record.get('request_id')} {outcome}{suffix}"
         )
+    return 0
+
+
+def _worker(config: dict[str, Any]) -> PersistentWorker:
+    local = config["local"]
+    return PersistentWorker(
+        local.get("python") or sys.executable, cfg.runtime_dir(), local.get("idle_timeout_s", 900)
+    )
+
+
+def _worker_status(config: dict[str, Any]) -> str:
+    local = config["local"]
+    if not local.get("persistent"):
+        return "oneshot (model loaded per decision)"
+    pid = _worker(config).pid()
+    state = f"running (pid {pid})" if pid else "not running (starts on first local decision)"
+    return f"persistent, {state}, idle exit after {local.get('idle_timeout_s', 900):g}s"
+
+
+def cmd_local_status(args: argparse.Namespace) -> int:
+    print(_worker_status(cfg.load()))
+    return 0
+
+
+def cmd_local_stop(args: argparse.Namespace) -> int:
+    stopped = _worker(cfg.load()).stop()
+    print("local worker stopped" if stopped else "local worker was not running")
     return 0
 
 
@@ -289,6 +318,12 @@ def parser() -> argparse.ArgumentParser:
     pull = local.add_parser("pull", help="download and pin the local model")
     pull.add_argument("--source")
     pull.set_defaults(func=cmd_local_pull)
+    local.add_parser("status", help="show the persistent worker").set_defaults(
+        func=cmd_local_status
+    )
+    local.add_parser("stop", help="stop the persistent worker (frees RAM/VRAM)").set_defaults(
+        func=cmd_local_stop
+    )
 
     s = sub.add_parser("install-rule", help="install the Cline rule")
     s.add_argument("--dest")

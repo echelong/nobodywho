@@ -61,9 +61,38 @@ decision doctor --live   # checks both providers with one real call each
 ```
 
 The default local model is NobodyWho's own test model, `NobodyWho/Qwen_Qwen3-0.6B-GGUF`
-(`Qwen_Qwen3-0.6B-Q4_K_M.gguf`, about 480 MB). Pass `--source huggingface:<owner>/<repo>/<file>.gguf`
-to pin another. Routing never downloads. After `pull` the local provider only opens the pinned file,
-so it works with no network.
+(`Qwen_Qwen3-0.6B-Q4_K_M.gguf`, about 480 MB). It is enough to test the plumbing, but it is too weak
+to benchmark decisions against. For shadow benchmarking, pin a stronger model:
+
+```bash
+decision local pull --source huggingface:NobodyWho/Qwen_Qwen3-4B-GGUF/Qwen_Qwen3-4B-Q4_K_M.gguf
+```
+
+That file is 2.5 GB and needs about 3 GB of RAM, or about 3 GB of VRAM with `"use_gpu": true` in the
+`local` section of the config. Routing never downloads. After `pull` the local provider only opens
+the pinned file, so it works with no network.
+
+## Local worker
+
+By default (`"persistent": true`) the first local decision starts a worker that keeps the model
+loaded, and later decisions reuse it:
+
+- It listens on a Unix socket in `$XDG_RUNTIME_DIR/decision-router/` (mode 0700). There is no
+  network port.
+- It exits after `idle_timeout_s` (default 900) without jobs.
+- It is restarted automatically if it dies.
+- A job that exceeds `timeout_s` kills the worker, so the next decision starts clean.
+
+`decision local status` shows the worker and `decision local stop` frees its memory. Set
+`"persistent": false` to load the model in a fresh process for every decision.
+
+Measured on a Ryzen 7 3700X / RTX 2070 SUPER with Qwen3-4B Q4_K_M, 3 samples, end to end per
+`decision ask`:
+
+| | Fresh process per decision | Persistent worker, warm |
+| --- | --- | --- |
+| CPU | ~2.9 s | ~1.8 s |
+| GPU (Vulkan) | ~1.9 s | ~0.4 s |
 
 ## Switching providers
 
@@ -111,8 +140,8 @@ Contract limits: 2-12 snake_case choices, `ABSTAIN` reserved, `risk` in `low|med
   `TYPESAFE_API_KEY`) and only placed in the `Authorization` header. The key and common token
   patterns are redacted from everything a provider sees and from every receipt. The local worker
   subprocess does not inherit the key.
-- **Bounded.** JEV calls have a request timeout. Local inference runs in a subprocess with a hard
-  timeout, so a hung or crashed native call cannot take the router down.
+- **Bounded.** JEV calls have a request timeout. Local inference runs in a separate worker process
+  with a hard timeout, so a hung or crashed native call cannot take the router down.
 
 ## Receipts
 

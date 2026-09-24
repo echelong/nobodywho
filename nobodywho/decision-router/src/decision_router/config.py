@@ -2,6 +2,7 @@
 
 Config: $XDG_CONFIG_HOME/decision-router/config.json
 Ledger: $XDG_STATE_HOME/decision-router/ledger.jsonl
+Worker: $XDG_RUNTIME_DIR/decision-router/local-worker.sock (persistent local model)
 
 The TypeSafe key is never stored here: it is read at call time from the
 existing JEV key file (or TYPESAFE_API_KEY), exactly like the JEV install does.
@@ -39,6 +40,8 @@ DEFAULTS: dict[str, Any] = {
         "use_gpu": False,
         "timeout_s": 60,
         "python": None,
+        "persistent": True,
+        "idle_timeout_s": 900,
     },
 }
 
@@ -60,6 +63,15 @@ def state_dir() -> Path:
     if override:
         return Path(override)
     return _xdg("XDG_STATE_HOME", ".local/state") / "decision-router"
+
+
+def runtime_dir() -> Path:
+    """Where the persistent local worker keeps its socket: private to this user's session."""
+    override = os.environ.get("DECISION_ROUTER_RUNTIME_DIR", "").strip()
+    if override:
+        return Path(override)
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    return Path(runtime) / "decision-router" if runtime else state_dir() / "run"
 
 
 def config_path() -> Path:

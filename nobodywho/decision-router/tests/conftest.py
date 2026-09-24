@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import shutil
+import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 from helpers import FAKE_KEY
 
 from decision_router.ledger import Ledger
+from decision_router.providers.nobodywho import PersistentWorker
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +28,12 @@ def isolated_env(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.chdir(tmp_path)
+    # Unix socket paths are length-limited, so the worker gets a short private dir.
+    runtime = Path(tempfile.mkdtemp(prefix="drt-"))
+    monkeypatch.setenv("DECISION_ROUTER_RUNTIME_DIR", str(runtime))
+    yield
+    PersistentWorker(sys.executable, runtime).stop()
+    shutil.rmtree(runtime, ignore_errors=True)
 
 
 @pytest.fixture

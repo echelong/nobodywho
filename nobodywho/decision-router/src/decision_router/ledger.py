@@ -29,6 +29,8 @@ _DETAIL_KEYS = (
     "runtime",
     "load_ms",
     "sample_ms",
+    "worker",
+    "model_reused",
 )
 
 
