@@ -491,3 +491,15 @@ def test_stop_waits_until_the_worker_has_exited():
     except OSError:
         pass
     assert state in ("", "Z", "X")
+
+
+def test_prune_receipt_records_how_many_blocks_the_model_judged(tmp_path):
+    from decision_router.ledger import Ledger
+
+    ledger = Ledger(tmp_path / "l.jsonl")
+    request = PruneRequest(output=LARGE[2], caller="codex")
+    result = Pruner([Tier(1, "nobodywho", "m", lambda r, p, b: {x: DROP for x in b},
+                          max_blocks=4)], jev_enabled=False).prune(request)  # fmt: skip
+    ledger.write([ledger.prune_receipt(request, result)])
+    attempt = json.loads(ledger.path.read_text())["attempts"][0]
+    assert attempt["judged_blocks"] == 4 and attempt["dropped_blocks"] == 4

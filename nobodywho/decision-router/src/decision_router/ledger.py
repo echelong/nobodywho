@@ -151,7 +151,16 @@ class Ledger:
             "attempts": [
                 {
                     k: a.get(k)
-                    for k in ("tier", "provider", "model", "outcome", "reason", "latency_ms")
+                    for k in (
+                        "tier",
+                        "provider",
+                        "model",
+                        "outcome",
+                        "reason",
+                        "latency_ms",
+                        "judged_blocks",
+                        "dropped_blocks",
+                    )
                 }
                 for a in result.attempts
             ],

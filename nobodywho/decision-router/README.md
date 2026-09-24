@@ -129,17 +129,18 @@ warm persistent worker, end to end per call (the desktop and other applications 
 
 | Model (Q4_K_M) | Operation | Cold | p50 | p95 | p99 | GPU offload | Quality |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3 4B | decision | 1.6 s | 278 ms | 308 ms | 339 ms | 37/37 | 16/16 |
-| Qwen3 4B | prune small (17-20k chars) | 1.9 s | 302 ms | 497 ms | 590 ms | 37/37 | facts 9/9 |
-| Qwen3 4B | prune medium (80-85k) | | 349 ms | 600 ms | 610 ms | 37/37 | facts 10/10 |
-| Qwen3 4B | prune large (0.6-0.7M) | | 870 ms | | | 37/37 | facts 2/2 |
-| Qwen3 4B | prune judgement | | 208 ms | | | | useful kept 9/9, noise dropped 2/10 |
-| Qwen3.5 9B | decision | 3.2 s | 537 ms | 772 ms | 783 ms | 33/33 | 16/16 |
-| Qwen3.5 9B | prune small / medium / large | 3.5 s | 1153 / 1161 / 1473 ms | | | 33/33 | facts all kept |
-| Qwen3.5 9B | prune judgement | | 498 ms | | | | useful kept 9/9, noise dropped 10/10 |
+| Qwen3 4B | decision | 1.6-3.5 s | 281 ms | 333 ms | 353 ms | 37/37 | 16/16 |
+| Qwen3 4B | prune small (17-20k chars) | 1.8 s | 298 ms | 482 ms | 571 ms | 37/37 | facts 9/9 |
+| Qwen3 4B | prune medium (80-85k) | | 359 ms | 602 ms | 621 ms | 37/37 | facts 10/10 |
+| Qwen3 4B | prune large (0.6-0.7M) | | 895 ms | | | 37/37 | facts 2/2 |
+| Qwen3 4B | prune judgement | | 245 ms | | | | useful kept 9/9, noise dropped 2/10 |
+| Qwen3.5 9B | decision | 3.2-7.6 s | 537 ms | 825 ms | 844 ms | 33/33 | 16/16 |
+| Qwen3.5 9B | prune small / medium / large | 3.7 s | 1149 / 1146 / 1422 ms | | | 33/33 | facts all kept |
+| Qwen3.5 9B | prune judgement | | 485 ms | | | | useful kept 9/9, noise dropped 10/10 |
 | Qwen3 0.6B | decision / prune judgement | 1.0 s | 180 / 93 ms | | | 29/29 | 10/16; useful kept 4/9 (fails) |
 | Qwen3.5 0.8B | decision / prune judgement | 4.9 s | 238 / 246 ms | | | 25/25 | 6/16; useful kept 3/9 (fails) |
-| Qwen3.6 27B | any | | | | | does not fit | GPU load fails (out of VRAM); CPU only |
+| Qwen3.6 27B | GPU | | | | | does not fit | load fails: out of VRAM |
+| Qwen3.6 27B | CPU decision / prune small / judgement | 124 s / 21 s | 95 s / 15 s / 5.8 s | | | CPU | useful kept 7/9 (fails) |
 
 Before this tuning the same 4B took 494 ms p50 per decision and 1.1-1.5 s / 4.3-4.9 s /
 5.2-5.8 s to prune small / medium / large outputs; the 9B took 1044 ms per decision.
@@ -216,6 +217,17 @@ text is generated. When the critical lines already fill the budget, no model is 
 ```bash
 decision prune --caller codex -- bash -c 'pytest -q'
 ```
+
+Adapters differ in how reliably they reach the pruner:
+
+- **Cline, Freebuff, OpenCode2, csmart (DeepSeek)** run shell commands through the caller's bash
+  shim, which runs `bash -c` commands under `decision prune` whenever stdout is captured.
+- **Claude, csmart (Opus)** use the `decision-prune` Claude plugin after every Bash call. Claude
+  Code cuts a *failed* command's output to about 10k characters (head and tail) before a hook sees
+  it, so the plugin prunes long successful output; long failing output stays Claude Code's cut.
+- **Codex** runs commands as `/bin/bash -lc …` by absolute path, so the shim is not used; its
+  adapter is only an instruction to wrap long commands in `decision prune --caller codex -- …`,
+  which the model may ignore.
 
 The one user config is `~/.config/decision-router/config.json`; all client adapters use the same
 router and append metadata-only receipts to `~/.local/state/decision-router/ledger.jsonl`. Original
