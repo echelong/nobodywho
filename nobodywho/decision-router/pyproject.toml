@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nobodywho-decision-router"
+version = "0.1.0"
+description = "Experimental provider-neutral decision router: TypeSafe JEV or local NobodyWho"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "EUPL-1.2" }
+dependencies = []
+
+[project.optional-dependencies]
+local = ["nobodywho>=3.0.0"]
+dev = ["pytest>=8", "ruff>=0.15", "ty>=0.0.47"]
+
+[project.scripts]
+decision = "decision_router.cli:main"
+
+[project.urls]
+Upstream = "https://github.com/nobodywho-ooo/nobodywho"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+decision_router = ["cline_rule.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "model: needs the local GGUF model (skipped when it is not present)",
+]
+
+[tool.ruff]
+line-length = 100
