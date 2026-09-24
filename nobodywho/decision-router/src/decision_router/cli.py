@@ -1076,7 +1076,16 @@ def _native_prune_after_error(
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
-    config = cfg.load()
+    try:
+        config = cfg.load()
+    except Exception:  # noqa: BLE001 - a broken config must not suppress command output
+        if args.run:
+            try:
+                return subprocess.call(args.run)
+            except OSError:
+                return 127
+        sys.stdout.buffer.write(sys.stdin.buffer.read())
+        return 0
     if args.action == "status":
         return cmd_prune_status(config)
     if args.action == "test":
@@ -1115,14 +1124,35 @@ def cmd_prune(args: argparse.Namespace) -> int:
     except UnicodeDecodeError:
         sys.stdout.buffer.write(raw)  # binary output passes through untouched
         return code if code >= 0 else 128 - code
-    if nested:
-        out, result = text, None
+    try:
+        threshold = max(0, int(config["prune"].get("min_output_chars", 16000)))
+    except (KeyError, TypeError, ValueError):
+        threshold = 16000
+    if args.budget_chars is not None:
+        threshold = min(threshold, args.budget_chars)
+    if nested or len(text) <= threshold:
+        out = text
+        result = (
+            PruneResult(
+                text=text,
+                provider="none",
+                original_chars=len(text),
+                result_chars=len(text),
+                original_tokens=estimate_tokens(text),
+                result_tokens=estimate_tokens(text),
+                kept_lines=len(text.splitlines()),
+                total_lines=len(text.splitlines()),
+                fallback_reason="nested" if nested else "under_threshold",
+            )
+            if args.json
+            else None
+        )
     else:
         out, result = _prune_text(args, config, text)
     if args.json and result is not None:
         _print(result.to_dict())
     else:
-        sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+        sys.stdout.write(out)
     sys.stdout.flush()
     return code if code >= 0 else 128 - code
 
@@ -1132,6 +1162,7 @@ def cmd_prune_status(config: dict[str, Any]) -> int:
     print("operation: prune (extractive; separate from `decision ask`)")
     print(f"budget: {pc['budget_chars']} chars, blocks of {pc['block_lines']} lines, "
           f"hard cap x{pc['hard_cap_factor']}")  # fmt: skip
+    print(f"minimum output: {pc.get('min_output_chars', 16000)} chars")
     for t in cfg.TIER_NAMES:
         settings = pc.get(f"tier{t}", {})
         provider = NobodyWhoProvider.for_tier(config, t)
@@ -1299,6 +1330,14 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true", help="print the PruneResult as JSON")
     s.set_defaults(func=cmd_prune, run=None)
 
+    s = sub.add_parser("run", help="run a command and prune its long stdout")
+    s.add_argument("--caller", required=True)
+    s.add_argument("--budget-chars", type=int)
+    s.add_argument("--goal")
+    s.add_argument("--command")
+    s.add_argument("--preserve", action="append")
+    s.set_defaults(func=cmd_prune, run=None, action=None, json=False)
+
     s = sub.add_parser("adapter", help="thin adapters for other tools")
     adapter = s.add_subparsers(dest="adapter_command", required=True)
     shim = adapter.add_parser("shim", help="write the bash shim a tool uses for pruning")
@@ -1315,7 +1354,7 @@ def parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     run: list[str] | None = None
-    if argv[:1] == ["prune"] and "--" in argv:  # decision prune [opts] -- COMMAND ARGS...
+    if argv[:1] in (["prune"], ["run"]) and "--" in argv:
         cut = argv.index("--")
         argv, run = argv[:cut], argv[cut + 1 :] or None
     args = parser().parse_args(argv)

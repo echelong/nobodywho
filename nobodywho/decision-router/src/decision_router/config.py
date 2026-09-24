@@ -63,6 +63,7 @@ DEFAULTS: dict[str, Any] = {
     # `decision prune`: extractive output pruning, local-first like `decision ask`.
     "prune": {
         "budget_chars": 12000,
+        "min_output_chars": 16000,
         "block_lines": 30,
         "hard_cap_factor": 2.0,
         "archive": False,  # output can contain secrets; the shared ledger stores sizes only
@@ -102,7 +103,18 @@ def runtime_dir() -> Path:
     if override:
         return Path(override)
     runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
-    return Path(runtime) / "decision-router" if runtime else state_dir() / "run"
+    if runtime:
+        return Path(runtime) / "decision-router"
+    # CLI clients may omit XDG_RUNTIME_DIR even when they share the same login
+    # session. Reuse its runtime directory so they cannot keep duplicate GPU
+    # workers resident under two socket paths.
+    user_runtime = Path(f"/run/user/{os.getuid()}")
+    try:
+        if user_runtime.stat().st_uid == os.getuid() and os.access(user_runtime, os.W_OK):
+            return user_runtime / "decision-router"
+    except OSError:
+        pass
+    return state_dir() / "run"
 
 
 def data_dir() -> Path:

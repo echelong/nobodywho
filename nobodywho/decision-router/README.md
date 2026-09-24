@@ -86,7 +86,8 @@ By default (`"persistent": true`) the first local decision starts a worker that 
 loaded, and later decisions reuse it:
 
 - It listens on a Unix socket in `$XDG_RUNTIME_DIR/decision-router/` (mode 0700). There is no
-  network port.
+  network port. On Linux, a client without `XDG_RUNTIME_DIR` reuses its owned
+  `/run/user/<uid>/decision-router/` directory when available.
 - It exits after `idle_timeout_s` (default 900) without jobs.
 - It is restarted automatically if it dies.
 - A job that exceeds `timeout_s` kills the worker, so the next decision starts clean.
@@ -216,18 +217,31 @@ text is generated. When the critical lines already fill the budget, no model is 
 
 ```bash
 decision prune --caller codex -- bash -c 'pytest -q'
+decision run --caller codex -- /bin/bash -lc 'pytest -q'
 ```
+
+The central `prune.min_output_chars` default is 16,000 characters. Shorter output
+passes through exactly, without a model call or receipt. `decision run` preserves
+the command's exit status and leaves stderr on its native stream. A nested call
+marked `DECISION_PRUNE_ACTIVE=1` also passes through unchanged.
 
 Adapters differ in how reliably they reach the pruner:
 
-- **Cline, Freebuff, OpenCode2, csmart (DeepSeek)** run shell commands through the caller's bash
+- **Cline** uses `adapters/cline/decision-prune.ts` as an `afterTool` plugin on
+  `run_commands`. It changes only long result text and retains command metadata.
+  Cline 3.0.65 itself middle-truncates command output to about 48,000 characters
+  before this hook; facts in the missing middle cannot be recovered by the plugin.
+- **Freebuff, OpenCode2, csmart (DeepSeek)** run shell commands through the caller's bash
   shim, which runs `bash -c` commands under `decision prune` whenever stdout is captured.
 - **Claude, csmart (Opus)** use the `decision-prune` Claude plugin after every Bash call. Claude
   Code cuts a *failed* command's output to about 10k characters (head and tail) before a hook sees
   it, so the plugin prunes long successful output; long failing output stays Claude Code's cut.
-- **Codex** runs commands as `/bin/bash -lc …` by absolute path, so the shim is not used; its
-  adapter is only an instruction to wrap long commands in `decision prune --caller codex -- …`,
-  which the model may ignore.
+- **Codex 0.156.1** uses `adapters/codex/pre_tool_use.sh` in a trusted `PreToolUse`
+  hook. This release's `PostToolUse` cannot replace shell output. The hook passes
+  the original command as one quoted argument to `adapters/shared/decision-run-shell.bash`
+  in Codex's existing Bash process. The shared runner captures stdout, applies
+  the central threshold, and returns the real exit code.
+  The installed hook must be trusted in Codex's `/hooks` screen.
 
 The one user config is `~/.config/decision-router/config.json`; all client adapters use the same
 router and append metadata-only receipts to `~/.local/state/decision-router/ledger.jsonl`. Original
