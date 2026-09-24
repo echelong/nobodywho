@@ -35,6 +35,7 @@ _PROVIDER_REASONS = {
     "jev_timeout": "timeout",
     "local_model_unavailable": "model_unavailable",
     "local_runtime_unavailable": "model_unavailable",
+    "local_gpu_unavailable": "model_unavailable",
     "local_malformed_response": "invalid_output",
     "jev_malformed_response": "invalid_output",
     "local_no_majority": "no_valid_choice",

@@ -7,6 +7,10 @@ provider never reports a probability. Instead it draws a few seeded samples,
 permuting option order per sample to expose position bias, and reports the
 winner's vote share as `sample_stability`. That number is a stability proxy,
 not a calibrated probability, and is labelled accordingly.
+
+Sampling stops early once the remaining samples could not change the winner
+or its acceptance; the share is then counted against every planned sample,
+so an early stop never reports more stability than a full run could.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from ..sanitize import short_error
 
 NAME = "nobodywho"
 WORKER = Path(__file__).resolve().parent.parent / "local_worker.py"
+MAX_SOCKET_PATH = 107  # bytes in sockaddr_un.sun_path, minus the terminator
 
 SYSTEM_PROMPT = (
     "You are a routing classifier for a software coding agent. Read the state, "
@@ -110,6 +115,19 @@ def subprocess_runner(python: str) -> Runner:
     return run
 
 
+def _wait_for_exit(pid: int, timeout_s: float = 3.0) -> None:
+    """Waits until `pid` is gone or a zombie (its memory is released either way)."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (OSError, IndexError):
+            return
+        if state in ("Z", "X"):
+            return
+        time.sleep(0.02)
+
+
 class PersistentWorker:
     """A per-user worker process that keeps the model loaded between decisions.
 
@@ -166,6 +184,8 @@ class PersistentWorker:
                 os.kill(pid, signal.SIGKILL)
             except OSError:
                 pid = None
+            else:
+                _wait_for_exit(pid)  # its VRAM is free once it has exited
         for path in (self.socket_path, self.pid_path):
             try:
                 path.unlink()
@@ -174,6 +194,8 @@ class PersistentWorker:
         return pid is not None
 
     def _start(self, deadline: float) -> socket.socket:
+        if len(os.fsencode(self.socket_path)) > MAX_SOCKET_PATH:
+            raise RuntimeError("worker socket path too long; set DECISION_ROUTER_RUNTIME_DIR")
         self.runtime_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.runtime_dir, 0o700)
         with open(self.lock_path, "a") as lock:
@@ -187,7 +209,7 @@ class PersistentWorker:
                 if os.environ.get("DECISION_ROUTER_CAPTURE_WORKER_LOG") == "1":
                     fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                     worker_log = os.fdopen(fd, "ab", buffering=0)
-                subprocess.Popen(
+                process = subprocess.Popen(
                     [
                         self.python, str(WORKER), "--serve", str(self.socket_path),
                         "--idle-timeout", str(self.idle_timeout_s),
@@ -207,6 +229,10 @@ class PersistentWorker:
                 try:
                     return self._connect()
                 except OSError:
+                    if process.poll() is not None:  # it died: waiting longer cannot help
+                        raise RuntimeError(
+                            f"local worker exited during start ({process.returncode})"
+                        ) from None
                     time.sleep(0.02)
         raise RuntimeError("local worker did not start")
 
@@ -252,6 +278,8 @@ class NobodyWhoProvider:
         model_info: dict[str, Any] | None = None,
         runner: Runner | None = None,
         python: str | None = None,
+        stop_when: dict[str, Any] | None = None,
+        cpu_fallback: bool = True,
     ) -> None:
         if not 1 <= int(samples) <= 15:
             raise ValueError("samples must be between 1 and 15")
@@ -264,17 +292,21 @@ class NobodyWhoProvider:
         self.timeout_s = float(timeout_s)
         self._model_info = model_info
         self.runner = runner or subprocess_runner(python or sys.executable)
+        self.stop_when = stop_when
+        self.cpu_fallback = bool(cpu_fallback)
         self.evict: list[PersistentWorker] = []
 
     @classmethod
     def from_config(cls, config: dict[str, Any], **kwargs: Any) -> NobodyWhoProvider:
         """The provider for `local` mode (and shadow/compare)."""
+        kwargs.setdefault("stop_when", early_stop(config, config["local"]))
         return cls.from_settings(config["local"], **kwargs)
 
     @classmethod
     def for_tier(cls, config: dict[str, Any], tier: str, **kwargs: Any) -> NobodyWhoProvider:
         """The provider for one local-first tier, with its own worker."""
         settings = cfg.tier_settings(config, tier)
+        kwargs.setdefault("stop_when", early_stop(config, settings))
         provider = cls.from_settings(settings, worker_name=f"tier{tier}-worker", **kwargs)
         for other in settings.get("evict_tiers") or ():
             other_settings = cfg.tier_settings(config, str(other))
@@ -314,6 +346,7 @@ class NobodyWhoProvider:
             n_ctx=local.get("n_ctx", 2048),
             use_gpu=local.get("use_gpu", False),
             timeout_s=local.get("timeout_s", 60),
+            cpu_fallback=local.get("cpu_fallback", True),
             model_info=info,
             python=python,
             **kwargs,
@@ -361,11 +394,15 @@ class NobodyWhoProvider:
             "model_path": self.model_path,
             "system_prompt": SYSTEM_PROMPT,
             "grammar": grammar_for(request.allowed()),
+            "choices": list(request.allowed()),
             "samples": plan_samples(request, self.samples, seed),
             "temperature": self.temperature,
             "n_ctx": self.n_ctx,
             "use_gpu": self.use_gpu,
+            "cpu_fallback": self.cpu_fallback,
         }
+        if self.stop_when:
+            job["stop_when"] = self.stop_when
         try:
             output = self.runner(job, self.timeout_s)
         except subprocess.TimeoutExpired:
@@ -387,10 +424,11 @@ class NobodyWhoProvider:
                 NAME, short_error(output["error"]), output.get("reason", "local_error"),
                 latency_ms=latency, model=model, details=details,
             )  # fmt: skip
-        for key in ("runtime", "load_ms", "sample_ms", "model_reused"):
+        for key in ("runtime", "load_ms", "sample_ms", "model_reused", "gpu_layers"):
             if key in output:
                 details[key] = output[key]
-        return aggregate(request, output.get("outputs"), latency, model, details)
+        planned = output.get("planned") if isinstance(output.get("planned"), int) else None
+        return aggregate(request, output.get("outputs"), latency, model, details, planned)
 
     def run_prompts(
         self,
@@ -417,6 +455,7 @@ class NobodyWhoProvider:
             "temperature": temperature,
             "n_ctx": self.n_ctx,
             "use_gpu": self.use_gpu,
+            "cpu_fallback": self.cpu_fallback,
         }
         return self.runner(job, self.timeout_s if timeout_s is None else timeout_s)
 
@@ -425,14 +464,30 @@ class NobodyWhoProvider:
         return Path(self.model_path).stem if self.model_path else None
 
 
+def early_stop(config: dict[str, Any], settings: dict[str, Any]) -> dict[str, Any] | None:
+    """The acceptance thresholds a worker may stop sampling at (None: draw every sample)."""
+    if settings.get("early_stop", True) is False:
+        return None
+    acceptance = config.get("acceptance", {})
+    return {
+        "min_share": float(acceptance.get("min_stability", 0.66)),
+        "min_margin": int(acceptance.get("min_margin", 1)),
+    }
+
+
 def aggregate(
     request: DecisionRequest,
     outputs: object,
     latency_ms: int,
     model: str | None,
     details: dict[str, Any],
+    planned: int | None = None,
 ) -> DecisionResult:
-    """Turns constrained samples into a vote and a sample-stability proxy."""
+    """Turns constrained samples into a vote and a sample-stability proxy.
+
+    `planned` > drawn samples means the worker stopped early; the winner's share
+    is then counted against every planned sample (a lower bound).
+    """
 
     def fail(error: str, reason: str) -> DecisionResult:
         return DecisionResult.failure(
@@ -447,6 +502,9 @@ def aggregate(
 
     ranked = Counter(outputs).most_common()
     total = len(outputs)
+    denominator = max(total, planned or 0)
+    if denominator > total:
+        details = dict(details, samples_planned=denominator, early_stop=True)
     winner, count = ranked[0]
     tie = len(ranked) > 1 and ranked[1][1] == count
     abstain = not tie and winner == ABSTAIN
@@ -456,7 +514,7 @@ def aggregate(
         abstain=abstain,
         model=model,
         latency_ms=latency_ms,
-        confidence=count / total,
+        confidence=count / denominator,
         confidence_kind=SAMPLE_STABILITY,
         votes=dict(ranked),
         samples=total,

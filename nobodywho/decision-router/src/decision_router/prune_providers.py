@@ -12,13 +12,14 @@ from typing import Any, Protocol
 from .providers.jev import JevProvider, load_key
 from .prune import (
     DROP,
-    GRAMMAR,
     KEEP,
     SYSTEM_PROMPT,
     Plan,
     PruneRequest,
     PruneTierError,
+    batch_prompt,
     block_prompt,
+    votes_grammar,
 )
 from .sanitize import redact
 
@@ -28,6 +29,7 @@ JEV_MAX_REQUESTS = 3
 _LOCAL_REASONS = {
     "local_model_unavailable": "model_unavailable",
     "local_runtime_unavailable": "model_unavailable",
+    "local_gpu_unavailable": "model_unavailable",
     "local_error": "worker_failure",
 }
 
@@ -42,10 +44,13 @@ class PromptRunner(Protocol):
 
 
 def local_judge(provider: PromptRunner, temperature: float = 0.1, timeout_s: float | None = None):
+    """Every judged block in one prompt and one grammar-constrained generation."""
+
     def judge(request: PruneRequest, p: Plan, blocks: list[tuple[int, int]]) -> dict:
-        prompts = [block_prompt(request, p.lines, b) for b in blocks]
+        prompt = batch_prompt(request, p.lines, blocks)
+        grammar = votes_grammar(len(blocks))
         try:
-            output = provider.run_prompts(SYSTEM_PROMPT, GRAMMAR, prompts, temperature, timeout_s)
+            output = provider.run_prompts(SYSTEM_PROMPT, grammar, [prompt], temperature, timeout_s)
         except subprocess.TimeoutExpired:
             raise PruneTierError("timeout") from None
         except Exception as error:  # noqa: BLE001 - any worker problem escalates
@@ -55,8 +60,11 @@ def local_judge(provider: PromptRunner, temperature: float = 0.1, timeout_s: flo
                 output.get("reason", "local_error") if isinstance(output, dict) else "local_error"
             )
             raise PruneTierError(_LOCAL_REASONS.get(reason, "provider_error"))
-        votes = output.get("outputs")
-        if not isinstance(votes, list) or len(votes) != len(blocks):
+        outputs = output.get("outputs")
+        if not isinstance(outputs, list) or len(outputs) != 1 or not isinstance(outputs[0], str):
+            raise PruneTierError("invalid_output", "expected one generation")
+        votes = outputs[0].split()
+        if len(votes) != len(blocks) or set(votes) - {KEEP, DROP}:
             raise PruneTierError("invalid_output", "wrong number of votes")
         return dict(zip(blocks, votes))
 

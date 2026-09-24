@@ -30,17 +30,20 @@ MAX_OUTPUT_CHARS = 8 << 20
 MIN_BUDGET_CHARS = 500
 DEFAULT_BUDGET_CHARS = 12_000
 BLOCK_PROMPT_CHARS = 900
+EXCERPT_CHARS = 240  # per block in the one batched local judgement
 KEEP, DROP = "keep", "drop"
 GRAMMAR = f'root ::= "{KEEP}" | "{DROP}"'
 REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 CALLER_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 SYSTEM_PROMPT = (
-    "You triage blocks of a command's output for a software coding agent. "
-    "Answer keep if the block holds anything the agent may need: results, "
-    "errors, warnings, file paths, line numbers, test names, identifiers, "
-    "versions, counts or a final status. Answer drop only for repetitive "
-    "progress, download or build noise that the agent does not need."
+    "You shorten a command's output for a software coding agent. Errors, warnings, "
+    "failures, file:line references, commands and summary lines are always kept "
+    "separately; you only see the remaining blocks. For each block answer drop if it "
+    "is routine noise the agent does not need (passing tests, progress, downloads, "
+    "successful compile, install or build steps, repeated status lines) and keep if "
+    "it holds information the agent may need (data the command was run to show, "
+    "unusual messages, configuration, results or values)."
 )
 
 # Lines kept no matter what any provider says.
@@ -52,8 +55,9 @@ CRITICAL = re.compile(
     r"|conflict|rejected|missing|invalid|undefined|mismatch)\b"
     r"|\b(exit(ed)?\s*(status|code)?|returned|status)\s*[:=]?\s*-?\d+"
     r"|(?<!\w)\d+\s+(?-i:passed|failed|skipped|xfailed|errors?|warnings?)\b"  # summaries
-    r"|[\w./-]+\.\w{1,6}:\d+"  # file.py:42 / src/lib.rs:10:5
-    r"|[\w./-]+\.\w{1,6}\(\d+,\d+\)"  # tsc: file.ts(88,14)
+    # file.py:42 / src/lib.rs:10:5 / tsc file.ts(88,14); anchored at a token start, which
+    # finds the same lines without retrying the greedy path match at every offset.
+    r"|(?<![\w./-])[\w./-]+\.\w{1,6}(?::\d+|\(\d+,\d+\))"
     r"|^\s*caused\ by\b"
     r"|\bline\s+\d+\b"
     r"|^\s*(E\s{2,}|FAILED|ERROR|FAIL|---\s+FAIL)"  # pytest / go test failures
@@ -196,6 +200,15 @@ class Plan:
     critical: set[int]
     blocks: list[tuple[int, int]]  # [start, end) of non-critical runs a provider judges
     repetitive: list[tuple[int, int]] = field(default_factory=list)  # dropped without a model
+    required: set[int] = field(default_factory=set)  # lines whose text must survive verbatim
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+
+
+def strip_ansi(text: str) -> str:
+    """Colour and cursor escape sequences carry no evidence for the agent."""
+    return _ANSI.sub("", text) if "\x1b" in text else text
 
 
 _TEMPLATE = re.compile(r"0x[0-9a-f]+|\d+(\.\d+)*", re.IGNORECASE)
@@ -211,23 +224,43 @@ def is_repetitive(lines: list[str]) -> bool:
 
 
 def plan(request: _PlanRequest, block_lines: int = 30, context: int = 2,
-         head: int = 5, tail: int = 15) -> Plan:  # fmt: skip
-    lines = request.output.splitlines()
+         head: int = 5, tail: int = 15, text: str | None = None) -> Plan:  # fmt: skip
+    """Critical lines, judged blocks and repetitive runs of `text` (default: the output).
+
+    Every line is matched against CRITICAL once. Runs of three or more identical
+    consecutive lines keep their first line; the copies are omitted without a model.
+    """
+    lines = (request.output if text is None else text).splitlines()
     n = len(lines)
     hints = [h.lower() for h in request.preserve]
+    required = {
+        i for i, line in enumerate(lines)
+        if CRITICAL.search(line) or (hints and any(h in line.lower() for h in hints))
+    }  # fmt: skip
     critical: set[int] = set(range(min(head, n))) | set(range(max(0, n - tail), n))
-    for i, line in enumerate(lines):
-        low = line.lower()
-        if CRITICAL.search(line) or any(h in low for h in hints):
-            critical.update(range(max(0, i - context), min(n, i + context + 1)))
+    for i in required:
+        critical.update(range(max(0, i - context), min(n, i + context + 1)))
+    copies: set[int] = set()
+    i = 1
+    while i < n:
+        if lines[i] and lines[i] == lines[i - 1]:
+            j = i
+            while j < n and lines[j] == lines[i - 1]:
+                j += 1
+            if j - i >= 2:
+                copies.update(range(i, j))
+            i = j
+        else:
+            i += 1
+    critical -= copies
     blocks: list[tuple[int, int]] = []
     i = 0
     while i < n:
-        if i in critical:
+        if i in critical or i in copies:
             i += 1
             continue
         start = i
-        while i < n and i not in critical and i - start < block_lines:
+        while i < n and i not in critical and i not in copies and i - start < block_lines:
             i += 1
         blocks.append((start, i))
     repetitive: list[tuple[int, int]] = []
@@ -241,7 +274,7 @@ def plan(request: _PlanRequest, block_lines: int = 30, context: int = 2,
             repetitive.append(b)
     # A repetitive run keeps its first line as an example of what was omitted.
     critical.update(b[0] for b in repetitive)
-    return Plan(lines, critical, judged, repetitive)
+    return Plan(lines, critical, judged, repetitive, required - copies)
 
 
 def block_prompt(request: PruneRequest, lines: list[str], block: tuple[int, int]) -> str:
@@ -259,43 +292,131 @@ def block_prompt(request: PruneRequest, lines: list[str], block: tuple[int, int]
     return "\n".join(parts)
 
 
+def excerpt(lines: list[str], block: tuple[int, int], limit: int = EXCERPT_CHARS) -> str:
+    text = "\n".join(lines[block[0] : block[1]])
+    if len(text) > limit:
+        text = text[: limit * 2 // 3] + " [...] " + text[-(limit // 3) :]
+    return text
+
+
+def batch_prompt(request: PruneRequest, lines: list[str], blocks: list[tuple[int, int]]) -> str:
+    """One prompt for every block a local tier judges: a single generation per prune."""
+    parts = []
+    if request.goal:
+        parts.append(f"Agent goal: {request.goal.strip()[:500]}")
+    if request.command:
+        parts.append(f"Command: {request.command.strip()[:200]}")
+    for k, b in enumerate(blocks, 1):
+        parts.append(f"Block {k} (lines {b[0] + 1}-{b[1]} of {len(lines)}):\n{excerpt(lines, b)}")
+    parts.append(
+        f"Answer keep or drop for each of the {len(blocks)} blocks, in order, separated by spaces."
+    )
+    return "\n\n".join(parts)
+
+
+def votes_grammar(count: int) -> str:
+    """Exactly `count` space-separated keep/drop verdicts."""
+    return "root ::= v" + ' " " v' * (count - 1) + f'\nv ::= "{KEEP}" | "{DROP}"'
+
+
+def _marker(gap: int, label: str) -> str:
+    return f"[... {gap} line{'s' if gap != 1 else ''} omitted by {label} ...]"
+
+
 def assemble(lines: list[str], keep: set[int], label: str) -> str:
     out: list[str] = []
     gap = 0
     for i, line in enumerate(lines):
         if i in keep:
             if gap:
-                out.append(f"[... {gap} line{'s' if gap != 1 else ''} omitted by {label} ...]")
+                out.append(_marker(gap, label))
                 gap = 0
             out.append(line)
         else:
             gap += 1
     if gap:
-        out.append(f"[... {gap} line{'s' if gap != 1 else ''} omitted by {label} ...]")
+        out.append(_marker(gap, label))
     return "\n".join(out)
+
+
+def _gaps(n: int, keep: set[int]) -> dict[int, int]:
+    """start -> end of every run of omitted lines."""
+    gaps: dict[int, int] = {}
+    i = 0
+    while i < n:
+        if i in keep:
+            i += 1
+            continue
+        start = i
+        while i < n and i not in keep:
+            i += 1
+        gaps[start] = i
+    return gaps
 
 
 def fit(
     p: Plan, votes: dict[tuple[int, int], str], budget: int, label: str
 ) -> tuple[str, set[int]]:
-    """Keep critical lines and kept blocks; drop kept blocks middle-out until under budget."""
+    """Keep critical lines and kept blocks; drop kept blocks middle-out until under budget.
+
+    The assembled size is updated per dropped block (blocks never hold critical
+    lines), so large outputs are assembled once instead of once per block.
+    """
     keep = set(p.critical)
     kept_blocks = [b for b in p.blocks if votes.get(b, KEEP) == KEEP]
     for b in kept_blocks:
         keep.update(range(*b))
-    text = assemble(p.lines, keep, label)
-    if len(text) <= budget:
-        return text, keep
+    lines, n = p.lines, len(p.lines)
+    by_start = _gaps(n, keep)
+    by_end = {end: start for start, end in by_start.items()}
+
+    def marker(start: int, end: int) -> int:
+        return len(_marker(end - start, label)) + 1
+
+    size = sum(len(lines[i]) + 1 for i in keep) + sum(marker(s, e) for s, e in by_start.items())
+    if size - 1 > budget:
+        # Drop the blocks furthest from both ends first: the middle of a log is the least useful.
+        kept_blocks.sort(key=lambda b: min(b[0], n - b[1]), reverse=True)
+        for start, end in kept_blocks:
+            keep.difference_update(range(start, end))
+            size -= sum(len(lines[i]) + 1 for i in range(start, end))
+            new_start, new_end = start, end
+            if start in by_end:  # merge with the gap just before
+                new_start = by_end.pop(start)
+                size -= marker(new_start, start)
+                del by_start[new_start]
+            if end in by_start:  # and the gap just after
+                new_end = by_start.pop(end)
+                size -= marker(end, new_end)
+                del by_end[new_end]
+            by_start[new_start], by_end[new_end] = new_end, new_start
+            size += marker(new_start, new_end)
+            if size - 1 <= budget:
+                break
+    return assemble(lines, keep, label), keep
+
+
+def candidates(p: Plan, budget: int, max_blocks: int, label: str) -> list[tuple[int, int]]:
+    """The blocks whose verdict can change the result, nearest the ends first.
+
+    `fit` keeps blocks from both ends inwards until the budget is full, so only
+    blocks that could fit in the room left by the critical lines are worth a
+    model's time. Twice that room is judged so dropped blocks can be replaced.
+    """
+    if max_blocks <= 0 or not p.blocks:
+        return []
+    room = budget - len(assemble(p.lines, p.critical, label))
+    if room <= 0:
+        return []
     n = len(p.lines)
-    # Drop the blocks furthest from both ends first: the middle of a log is the least useful.
-    kept_blocks.sort(key=lambda b: min(b[0], n - b[1]), reverse=True)
-    for b in kept_blocks:
-        keep.difference_update(range(*b))
-        keep.update(p.critical & set(range(*b)))
-        text = assemble(p.lines, keep, label)
-        if len(text) <= budget:
+    chosen: list[tuple[int, int]] = []
+    total = 0
+    for b in sorted(p.blocks, key=lambda b: (min(b[0], n - b[1]), b[0])):
+        if len(chosen) >= max_blocks or total >= 2 * room:
             break
-    return text, keep
+        chosen.append(b)
+        total += sum(len(line) + 1 for line in p.lines[b[0] : b[1]])
+    return sorted(chosen)
 
 
 def hard_cap(text: str, cap: int) -> str:
@@ -392,7 +513,7 @@ class Pruner:
                 started, total_lines,
             )  # fmt: skip
 
-        p = plan(request, self.block_lines)
+        p = plan(request, self.block_lines, text=strip_ansi(original))
         archive = self._archive(request)
         attempts: list[dict[str, Any]] = []
         chain = list(self.tiers)
@@ -406,14 +527,13 @@ class Pruner:
                 previous_reason = "jev_disabled"
                 continue
             t0 = time.monotonic()
-            candidates = sorted(p.blocks, key=lambda b: b[1] - b[0], reverse=True)[
-                : tier.max_blocks
-            ]
+            label = f"decision prune ({tier.provider})"
+            judged = candidates(p, request.budget_chars, tier.max_blocks, label)
             try:
                 if tier is self.jev:
                     self.jev_calls += 1
-                votes = tier.judge(request, p, candidates) if candidates else {}
-                if set(votes.values()) - {KEEP, DROP} or set(votes) - set(candidates):
+                votes = tier.judge(request, p, judged) if judged else {}
+                if set(votes.values()) - {KEEP, DROP} or set(votes) - set(judged):
                     raise PruneTierError("invalid_output", "votes outside keep/drop")
             except PruneTierError as error:
                 attempts.append({"tier": tier.tier, "provider": tier.provider, "model": tier.model,
@@ -421,10 +541,9 @@ class Pruner:
                                  "latency_ms": _ms(t0)})  # fmt: skip
                 previous_reason = error.reason
                 continue
-            label = f"decision prune ({tier.provider})"
             text, keep = fit(p, votes, request.budget_chars, label)
             text = self._finish(hard_cap(text, self._cap(request)), archive, len(keep), p)
-            missing = self._missing_required_facts(request, p, text)
+            missing = self._missing_required_facts(p, text)
             if missing:
                 attempts.append({"tier": tier.tier, "provider": tier.provider, "model": tier.model,
                                  "outcome": "failed", "reason": "pruning_quality_failure",
@@ -432,7 +551,7 @@ class Pruner:
                 previous_reason = "pruning_quality_failure"
                 continue
             attempts.append({"tier": tier.tier, "provider": tier.provider, "model": tier.model,
-                             "outcome": "accepted", "judged_blocks": len(candidates),
+                             "outcome": "accepted", "judged_blocks": len(judged),
                              "dropped_blocks": sum(v == DROP for v in votes.values()),
                              "latency_ms": _ms(t0)})  # fmt: skip
             return self._done(
@@ -465,13 +584,9 @@ class Pruner:
         )  # fmt: skip
 
     @staticmethod
-    def _missing_required_facts(request: PruneRequest, p: Plan, text: str) -> list[str]:
-        hints = tuple(hint.lower() for hint in request.preserve)
-        required = {
-            line
-            for line in p.lines
-            if CRITICAL.search(line) or any(hint in line.lower() for hint in hints)
-        }
+    def _missing_required_facts(p: Plan, text: str) -> list[str]:
+        """Critical and hinted lines (matched once, in `plan`) absent from the result."""
+        required = {p.lines[i] for i in p.required}
         return [line for line in required if line and line not in text]
 
     def _cap(self, request: PruneRequest) -> int:

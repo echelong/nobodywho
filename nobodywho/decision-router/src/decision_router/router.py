@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import os
 import re
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -230,6 +229,8 @@ class Router:
 
     def _both(self, request: DecisionRequest) -> tuple[DecisionResult, DecisionResult]:
         """JEV and NobodyWho on the identical sanitized request, concurrently."""
+        from concurrent.futures import ThreadPoolExecutor  # shadow/compare only
+
         with ThreadPoolExecutor(max_workers=1) as pool:
             local = pool.submit(self._call, "nobodywho", request)
             jev = self._call("jev", request)

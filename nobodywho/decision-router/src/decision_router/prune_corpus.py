@@ -183,3 +183,287 @@ CASES = (
 
 def cases() -> list[tuple[str, str, str, list[str]]]:
     return [make() for make in CASES]
+
+
+# ---------------------------------------------------------------- sized outputs (latency)
+
+
+def pytest_verbose(n_tests: int, seed: int = 7) -> tuple[str, str, str, list[str]]:
+    """`pytest -v`: many distinct passing test lines around one failure."""
+    r = random.Random(seed)
+    mods = ["test_models", "test_views", "test_api", "test_forms", "test_utils", "test_billing",
+            "test_auth", "test_cache", "test_orders", "test_search"]  # fmt: skip
+    verbs = ["creates", "rejects", "updates", "lists", "renders", "parses", "validates", "caches",
+             "serializes", "handles"]  # fmt: skip
+    nouns = ["user", "invoice", "order", "session", "token", "profile", "cart", "report",
+             "address", "coupon", "webhook", "payload"]  # fmt: skip
+    lines = ["============================= test session starts ==============================",
+             "platform linux -- Python 3.14.7, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3",
+             "cachedir: .pytest_cache", "rootdir: /home/dev/shop", "configfile: pyproject.toml",
+             f"collected {n_tests + 1} items", ""]  # fmt: skip
+    fail_at = n_tests * 2 // 3
+    for i in range(n_tests):
+        if i == fail_at:
+            lines.append("tests/test_orders.py::test_refund_rounds_half_even FAILED"
+                         f"{' ' * 18}[{i * 100 // n_tests:3d}%]")  # fmt: skip
+        name = f"test_{r.choice(verbs)}_{r.choice(nouns)}_{r.choice(nouns)}"
+        extra = r.choice(["", "[sqlite]", "[postgres]", "[en-US]", "[de-DE]", "[fast]"])
+        lines.append(
+            f"tests/{r.choice(mods)}.py::{name}{extra} PASSED{' ' * 20}[{i * 100 // n_tests:3d}%]"
+        )
+    lines += [
+        "", "=================================== FAILURES ===================================",
+        "________________________ test_refund_rounds_half_even _________________________",
+        "", "    def test_refund_rounds_half_even():",
+        "        order = make_order(total=Decimal('10.05'))",
+        ">       assert refund(order, ratio=Decimal('0.5')) == Decimal('5.02')",
+        "E       AssertionError: assert Decimal('5.03') == Decimal('5.02')",
+        "", "tests/test_orders.py:118: AssertionError",
+        "=========================== short test summary info ============================",
+        ("FAILED tests/test_orders.py::test_refund_rounds_half_even - AssertionError: "
+         "assert Decimal('5.03') == Decimal('5.02')"),
+        f"======================== 1 failed, {n_tests} passed in 41.07s ========================",
+    ]  # fmt: skip
+    return (f"pytest-v-{n_tests}", "python -m pytest -v", "\n".join(lines),
+            ["tests/test_orders.py::test_refund_rounds_half_even",
+             "AssertionError: assert Decimal('5.03') == Decimal('5.02')",
+             "tests/test_orders.py:118", f"1 failed, {n_tests} passed"])  # fmt: skip
+
+
+def verbose_build(n_units: int, seed: int = 11) -> tuple[str, str, str, list[str]]:
+    """`make V=1`: many distinct compiler command lines, one warning, one error."""
+    r = random.Random(seed)
+    dirs = ["src/core", "src/net", "src/io", "src/util", "lib/codec", "lib/crypto", "src/ui"]
+    stems = ["buffer", "socket", "parser", "reader", "writer", "hash", "config", "queue",
+             "event", "timer", "codec", "frame", "stream", "pool", "table", "string"]  # fmt: skip
+    flags = ["-O2", "-g", "-Wall", "-Wextra", "-fPIC", "-DNDEBUG", "-std=c11", "-pthread",
+             "-Iinclude", "-Ithird_party/zlib", "-MMD", "-MP"]  # fmt: skip
+    lines = ["make[1]: Entering directory '/home/dev/proj/build'",
+             "-- The C compiler identification is GNU 15.2.1",
+             "-- Configuring done (0.4s)", "-- Generating done (0.1s)"]  # fmt: skip
+    warn_at, err_at = n_units // 3, n_units * 5 // 6
+    for i in range(n_units):
+        d, s = r.choice(dirs), r.choice(stems) + r.choice(["", "_v2", "_impl", "_ops", "_test"])
+        obj = f"obj/{d.replace('/', '_')}_{s}.o"
+        lines.append(f"gcc {' '.join(r.sample(flags, 7))} -c {d}/{s}.c -o {obj}")
+        if r.random() < 0.3:
+            lines.append(f"ar rcs lib/lib{d.split('/')[-1]}.a {obj}")
+        if i == warn_at:
+            lines += [("src/net/socket_impl.c:214:17: warning: comparison of integer expressions "
+                       "of different signedness: 'int' and 'size_t' [-Wsign-compare]"),
+                      "  214 |     for (int k = 0; k < len; k++) {",
+                      "      |                 ^"]  # fmt: skip
+        if i == err_at:
+            lines += [("lib/codec/frame_ops.c:87:5: error: implicit declaration of function "
+                       "'frame_reset' [-Wimplicit-function-declaration]"),
+                      "   87 |     frame_reset(f);", "      |     ^~~~~~~~~~~"]  # fmt: skip
+    lines += ["make[1]: *** [Makefile:212: obj/lib_codec_frame_ops.o] Error 1",
+              "make[1]: Leaving directory '/home/dev/proj/build'",
+              "make: *** [Makefile:40: all] Error 2"]  # fmt: skip
+    return (f"build-v-{n_units}", "make V=1", "\n".join(lines),
+            ["src/net/socket_impl.c:214:17: warning", "lib/codec/frame_ops.c:87:5: error",
+             "implicit declaration of function 'frame_reset'", "Makefile:212", "Error 2"])  # fmt: skip
+
+
+def sized_cases() -> list[tuple[str, tuple[str, str, str, list[str]]]]:
+    """(size, case): small ~17-20k, medium ~80-85k and large ~0.6-0.7M characters."""
+    return [("small", pytest_verbose(180)), ("small", verbose_build(160)),
+            ("medium", pytest_verbose(900)), ("medium", verbose_build(700)),
+            ("large", pytest_verbose(7000)), ("large", verbose_build(6000))]  # fmt: skip
+
+
+# ---------------------------------------------------------------- labelled blocks (judgement)
+
+
+def judgement_cases() -> list[tuple[str, list[tuple[str, list[str]]]]]:
+    """(command, [(label, block lines)]): what a local judge should keep or drop.
+
+    `keep` blocks hold what the agent ran the command for (results, values,
+    tables, requested data); `drop` blocks are routine success or progress noise.
+    None of these lines is critical, so only the judge decides them.
+    """
+    passed = [f"tests/test_{m}.py::test_{v}_{n} PASSED{' ' * 12}[{p:3d}%]"
+              for p, (m, v, n) in enumerate(zip(
+                  ["api", "views", "orders", "cart", "auth", "billing", "forms", "cache"] * 3,
+                  ["creates", "lists", "updates", "renders", "handles", "parses"] * 4,
+                  ["user", "order", "coupon", "session", "invoice", "profile", "token"] * 4))]  # fmt: skip
+    return [
+        (
+            "python -m pytest -v --cov=shop",
+            [
+                ("drop", passed[:8]),
+                (
+                    "keep",
+                    [
+                        "----------------------------- Captured stdout call -----------------------------",
+                        "refund computed: amount=5.03 currency=EUR ratio=0.5",
+                        "rounding mode: ROUND_HALF_UP (settings.MONEY_ROUNDING)",
+                        "order id=8841 total=10.05 items=3 customer=acme-gmbh",
+                    ],
+                ),
+                ("drop", passed[8:16]),
+                (
+                    "keep",
+                    [
+                        "---------- coverage: platform linux, python 3.14.7 -----------",
+                        "Name                 Stmts   Miss  Cover",
+                        "shop/orders.py         212     31    85%",
+                        "shop/refunds.py         64     22    66%",
+                        "TOTAL                 1840    203    89%",
+                    ],
+                ),
+                ("drop", passed[16:24]),
+            ],
+        ),
+        (
+            "pip install -r requirements.txt",
+            [
+                (
+                    "drop",
+                    [
+                        "Collecting requests>=2.31",
+                        "  Downloading requests-2.32.3-py3-none-any.whl (64 kB)",
+                        "Collecting urllib3<3,>=1.21.1",
+                        "  Downloading urllib3-2.3.0-py3-none-any.whl (128 kB)",
+                        "Collecting idna<4,>=2.5",
+                        "  Using cached idna-3.10-py3-none-any.whl (70 kB)",
+                    ],
+                ),
+                (
+                    "drop",
+                    [
+                        "Requirement already satisfied: certifi>=2017.4.17 in ./.venv/lib/python3.14/site-packages",
+                        "Requirement already satisfied: charset-normalizer<4,>=2 in ./.venv/lib/python3.14/site-packages",
+                        "Requirement already satisfied: packaging>=23 in ./.venv/lib/python3.14/site-packages",
+                    ],
+                ),
+                (
+                    "keep",
+                    [
+                        "Installing collected packages: urllib3, idna, requests",
+                        "Successfully installed idna-3.10 requests-2.32.3 urllib3-2.3.0",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "npm run build",
+            [
+                (
+                    "drop",
+                    [
+                        f"transforming ({n}) src/components/{c}.tsx"
+                        for n, c in zip(
+                            range(40, 400, 60), ["Button", "Modal", "Table", "Form", "Nav", "Card"]
+                        )
+                    ],
+                ),
+                (
+                    "keep",
+                    [
+                        "dist/index.html                   0.46 kB │ gzip:   0.30 kB",
+                        "dist/assets/index-4f1c2a.css     21.87 kB │ gzip:   4.91 kB",
+                        "dist/assets/index-9be21d.js     512.31 kB │ gzip: 160.02 kB",
+                        "✓ built in 7.42s",
+                    ],
+                ),
+                (
+                    "drop",
+                    [
+                        "rendering chunks...",
+                        "computing gzip size...",
+                        "copying public assets...",
+                        "cleaning dist before build...",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "git log --oneline -n 12",
+            [
+                (
+                    "keep",
+                    [
+                        "9c631a7 Add local-first routing and a separate extractive prune operation",
+                        "6e56a63 Keep the local model loaded and harden the Cline rule",
+                        "6035572 Add experimental provider-neutral decision router",
+                        "20ca085 Remove broken AddBos logic",
+                    ],
+                ),
+                (
+                    "keep",
+                    [
+                        "c14d3b5 Improve readme",
+                        "ddf3840 Complete rewrite of godot bindings",
+                        "9dc04ef chore: Fix CHANGELOG.md after previous release",
+                        "9e36241 Update llama-cpp-2 to 0.1.156",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "cargo build --release",
+            [
+                (
+                    "drop",
+                    [
+                        f"   Compiling {c} v{v}"
+                        for c, v in [
+                            ("proc-macro2", "1.0.92"),
+                            ("unicode-ident", "1.0.14"),
+                            ("quote", "1.0.37"),
+                            ("syn", "2.0.90"),
+                            ("serde_derive", "1.0.215"),
+                            ("serde", "1.0.215"),
+                        ]
+                    ],
+                ),
+                (
+                    "drop",
+                    [
+                        f"   Compiling {c} v{v}"
+                        for c, v in [
+                            ("tokio", "1.42.0"),
+                            ("mio", "1.0.3"),
+                            ("bytes", "1.9.0"),
+                            ("hyper", "1.5.1"),
+                            ("tower", "0.5.1"),
+                            ("axum", "0.7.9"),
+                        ]
+                    ],
+                ),
+                (
+                    "keep",
+                    [
+                        "    Finished `release` profile [optimized] target(s) in 41.37s",
+                        "     Running `target/release/shopd --config shop.toml`",
+                        "listening on port 8080 (workers=16, database shop on host db)",
+                    ],
+                ),
+            ],
+        ),
+        (
+            "terraform plan",
+            [
+                (
+                    "drop",
+                    [
+                        "aws_s3_bucket.assets: Refreshing state... [id=shop-assets-prod]",
+                        "aws_iam_role.app: Refreshing state... [id=shop-app-role]",
+                        "aws_security_group.web: Refreshing state... [id=sg-0a1b2c3d]",
+                    ],
+                ),
+                (
+                    "keep",
+                    [
+                        "  ~ aws_instance.web will be updated in-place",
+                        '  ~ resource "aws_instance" "web" {',
+                        '      ~ instance_type = "t3.small" -> "t3.medium"',
+                        '        id            = "i-0123456789abcdef0"',
+                        "    }",
+                    ],
+                ),
+                ("keep", ["Plan: 0 to add, 1 to change, 0 to destroy."]),
+            ],
+        ),
+    ]

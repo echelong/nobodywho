@@ -17,6 +17,7 @@ from decision_router.ledger import Ledger
 from decision_router.providers.jev import JevProvider
 from decision_router.prune import (
     DROP,
+    EXCERPT_CHARS,
     KEEP,
     Pruner,
     PruneRequest,
@@ -25,6 +26,7 @@ from decision_router.prune import (
     Tier,
     is_repetitive,
     plan,
+    votes_grammar,
 )
 from decision_router.prune_corpus import cases
 from decision_router.prune_providers import jev_judge, local_judge
@@ -234,25 +236,34 @@ def test_failed_jev_ends_in_native_truncation():
 # ---------------------------------------------------------------- provider judges
 
 
-def test_local_judge_maps_worker_outcomes():
+def test_local_judge_is_one_generation_for_all_blocks():
     class Fake:
         def __init__(self, output=None, raises=None):
             self.output, self.raises = output, raises
+            self.prompts: list[str] = []
 
         def run_prompts(self, system_prompt, grammar, prompts, temperature, timeout_s=None):
-            assert grammar == 'root ::= "keep" | "drop"'
+            assert grammar == votes_grammar(3)
+            self.prompts += prompts
             if self.raises:
                 raise self.raises
-            return self.output if self.output is not None else {"outputs": [DROP] * len(prompts)}
+            return self.output if self.output is not None else {"outputs": ["drop keep drop"]}
 
     p = plan(PruneRequest(output=LONG))
     blocks = p.blocks[:3]
-    assert set(local_judge(Fake())(PruneRequest(output=LONG), p, blocks).values()) == {DROP}
+    fake = Fake()
+    votes = local_judge(fake)(PruneRequest(output=LONG, command="pytest"), p, blocks)
+    assert list(votes.values()) == [DROP, KEEP, DROP] and list(votes) == blocks
+    assert len(fake.prompts) == 1  # one prompt, one generation, however many blocks
+    assert "Command: pytest" in fake.prompts[0] and "Block 3 (lines" in fake.prompts[0]
+    assert len(fake.prompts[0]) < 3 * (EXCERPT_CHARS + 60) + 300
     for fake, reason in [
         (Fake(raises=subprocess.TimeoutExpired("w", 1)), "timeout"),
         (Fake({"error": "x", "reason": "local_model_unavailable"}), "model_unavailable"),
         (Fake({"error": "x", "reason": "local_error"}), "worker_failure"),
         (Fake({"outputs": [KEEP]}), "invalid_output"),
+        (Fake({"outputs": ["keep keep keep", "drop drop drop"]}), "invalid_output"),
+        (Fake({"outputs": ["keep maybe drop"]}), "invalid_output"),
     ]:
         with pytest.raises(PruneTierError) as err:
             local_judge(fake)(PruneRequest(output=LONG), p, blocks)

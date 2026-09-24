@@ -147,6 +147,9 @@ def test_real_local_decision(capsys):
     assert decision["error"] is None, decision
     assert decision["provider"] == "nobodywho"
     assert decision["confidence_kind"] == "sample_stability"
-    assert sum(decision["votes"].values()) == 3
+    drawn = sum(decision["votes"].values())
+    # Two agreeing samples settle a 3-sample vote; the share still counts all 3.
+    assert drawn == 3 or (drawn == 2 and decision["details"]["samples_planned"] == 3)
+    assert decision["confidence"] == max(decision["votes"].values()) / 3
     assert set(decision["votes"]) <= {"retry_same", "inspect_tz", "ABSTAIN"}
     assert decision["details"]["quantization"] == "Q4_K_M"

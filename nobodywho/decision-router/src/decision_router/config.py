@@ -47,9 +47,10 @@ DEFAULTS: dict[str, Any] = {
     },
     # local-first: each tier inherits every "local" setting it does not override.
     "tiers": {
-        "1": {"label": "tier1"},
-        # evict_tiers: GPU workers to stop before this tier cold-starts (8 GB cards cannot
-        # hold a resident tier 1 and a 27B's Vulkan buffers at once).
+        # evict_tiers: GPU workers to stop before this tier cold-starts. An 8 GB card holds
+        # one of tier 1 (4B, ~3 GB) and tier 2 (9B, ~5.5 GB), not both, and NobodyWho fills
+        # whatever VRAM is left with layers without reserving room for the context.
+        "1": {"label": "tier1", "evict_tiers": ["2"]},
         "2": {"label": "tier2", "idle_timeout_s": 120, "timeout_s": 300, "evict_tiers": ["1"]},
     },
     # When a local tier's answer is good enough to stop escalating.
@@ -65,7 +66,8 @@ DEFAULTS: dict[str, Any] = {
         "block_lines": 30,
         "hard_cap_factor": 2.0,
         "archive": False,  # output can contain secrets; the shared ledger stores sizes only
-        "tier1": {"max_blocks": 24, "timeout_s": 45},
+        # Blocks a local tier judges in its one generation; 8 short excerpts fit n_ctx 2048.
+        "tier1": {"max_blocks": 8, "timeout_s": 45},
         "tier2": {"enabled": True, "max_blocks": 8, "timeout_s": 150},
         "jev_max_blocks": 60,
     },

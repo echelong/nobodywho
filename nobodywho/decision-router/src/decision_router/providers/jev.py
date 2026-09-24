@@ -11,8 +11,6 @@ import json
 import math
 import os
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -42,6 +40,9 @@ def load_key(key_file: str | None) -> str:
 def urllib_transport(
     url: str, headers: dict[str, str], body: bytes, timeout: float
 ) -> tuple[int, str]:
+    import urllib.error  # only a real JEV call pays for the HTTP stack
+    import urllib.request
+
     request = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

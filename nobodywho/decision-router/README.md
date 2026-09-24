@@ -94,13 +94,66 @@ loaded, and later decisions reuse it:
 `decision local status` shows the worker and `decision local stop` frees its memory. Set
 `"persistent": false` to load the model in a fresh process for every decision.
 
-Measured on a Ryzen 7 3700X / RTX 2070 SUPER with Qwen3-4B Q4_K_M, 3 samples, end to end per
-`decision ask`:
+Each worker also stops early:
 
-| | Fresh process per decision | Persistent worker, warm |
-| --- | --- | --- |
-| CPU | ~2.9 s | ~1.8 s |
-| GPU (Vulkan) | ~1.9 s | ~0.4 s |
+- a sample stops as soon as the text generated so far can only become one option id (the grammar
+  forces the rest), which usually means one decoded token instead of three to five;
+- sampling stops once the remaining samples could not change the winner or whether it passes the
+  acceptance policy (with the default 3 samples and `min_stability` 0.66, two agreeing samples
+  settle it). The reported `sample_stability` is then the winner's votes over *all planned*
+  samples, so an early stop never reports more stability than a full run could. Set
+  `"early_stop": false` on a tier to always draw every sample.
+
+Before a GPU load the worker checks free VRAM (NVIDIA): NobodyWho offloads as many layers as fill
+free VRAM without reserving room for the context, so a model that does not fully fit fails with an
+out-of-memory error rather than running partially offloaded. A model that does not fit is loaded on
+CPU instead, or, with `"cpu_fallback": false`, the tier fails fast so the next tier runs. Each GPU
+tier stops the other tier's GPU worker before it cold-starts (`evict_tiers`), because an 8 GB card
+holds the 4B or the 9B, not both.
+
+## Latency
+
+`decision benchmark latency` measures every call the way a coding client makes it: a fresh
+`decision` process (start-up, config, socket, persistent worker, inference, validation, ledger)
+against a private temporary config in which the measured model is tier 1. It never contacts
+TypeSafe and does not touch the real config, ledger or workers.
+
+```bash
+decision benchmark latency                       # the configured models
+decision benchmark latency --installed           # every cached GGUF
+decision benchmark latency --model /path/to.gguf --operation prune --sizes small,medium
+```
+
+Measured 2026-09-24 on a Ryzen 7 3700X / 32 GB / RTX 2070 SUPER (8 GB, Vulkan), NobodyWho 3.0.0,
+warm persistent worker, end to end per call (the desktop and other applications were running):
+
+| Model (Q4_K_M) | Operation | Cold | p50 | p95 | p99 | GPU offload | Quality |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3 4B | decision | 1.6 s | 278 ms | 308 ms | 339 ms | 37/37 | 16/16 |
+| Qwen3 4B | prune small (17-20k chars) | 1.9 s | 302 ms | 497 ms | 590 ms | 37/37 | facts 9/9 |
+| Qwen3 4B | prune medium (80-85k) | | 349 ms | 600 ms | 610 ms | 37/37 | facts 10/10 |
+| Qwen3 4B | prune large (0.6-0.7M) | | 870 ms | | | 37/37 | facts 2/2 |
+| Qwen3 4B | prune judgement | | 208 ms | | | | useful kept 9/9, noise dropped 2/10 |
+| Qwen3.5 9B | decision | 3.2 s | 537 ms | 772 ms | 783 ms | 33/33 | 16/16 |
+| Qwen3.5 9B | prune small / medium / large | 3.5 s | 1153 / 1161 / 1473 ms | | | 33/33 | facts all kept |
+| Qwen3.5 9B | prune judgement | | 498 ms | | | | useful kept 9/9, noise dropped 10/10 |
+| Qwen3 0.6B | decision / prune judgement | 1.0 s | 180 / 93 ms | | | 29/29 | 10/16; useful kept 4/9 (fails) |
+| Qwen3.5 0.8B | decision / prune judgement | 4.9 s | 238 / 246 ms | | | 25/25 | 6/16; useful kept 3/9 (fails) |
+| Qwen3.6 27B | any | | | | | does not fit | GPU load fails (out of VRAM); CPU only |
+
+Before this tuning the same 4B took 494 ms p50 per decision and 1.1-1.5 s / 4.3-4.9 s /
+5.2-5.8 s to prune small / medium / large outputs; the 9B took 1044 ms per decision.
+
+Chosen tiers, per operation:
+
+- **decision**: tier 1 Qwen3 4B (GPU, resident), tier 2 Qwen3.5 9B (GPU, cold-starts after
+  evicting tier 1, `cpu_fallback: false`), tier 3 JEV only when enabled. The 9B was as accurate
+  as the 4B on the benchmark but twice as slow.
+- **prune**: tier 1 Qwen3 4B, tier 2 Qwen3.5 9B, JEV only when enabled, then native truncation.
+  The 9B judges noise better, but at 1.1-1.5 s it misses the 500 ms target; the 4B never dropped
+  a useful block. The 0.6B and 0.8B models are faster but drop useful blocks.
+- The 27B is not in the interactive path: on this card it cannot be partially offloaded with
+  NobodyWho 3.0.0, and on CPU a call takes tens of seconds.
 
 ## Switching providers
 
@@ -114,7 +167,8 @@ decision provider compare    # explicit A/B testing
 decision provider local-first
 decision jev status          # global TypeSafe kill switch state
 decision jev disable         # hard block on TypeSafe calls in every mode
-decision benchmark           # explicit local decision and pruning benchmark
+decision benchmark           # explicit local decision and pruning quality benchmark
+decision benchmark latency   # end-to-end latency per local model and operation (never JEV)
 DECISION_ROUTER_MODE=local decision ask ...   # one-off override
 ```
 
@@ -151,6 +205,13 @@ preserves error text, file and line references, test failures, commands, warning
 counts, and marks omitted spans. It tries Tier 1, Tier 2 after a quality or provider failure, JEV
 only after both local tiers fail and the global switch is on, then native bounded truncation. A prune
 failure never changes the command's exit status or stderr.
+
+Most of the work is deterministic: colour codes are removed, runs of identical lines keep one copy,
+every line is matched against the critical-line rules once, and repetitive progress is dropped
+without a model. A local tier is then asked about only the blocks that could still fit in the
+budget, nearest the start and end of the output first (at most `max_blocks`, default 8), in **one
+prompt and one generation** that answers `keep` or `drop` per block. No samples are repeated and no
+text is generated. When the critical lines already fill the budget, no model is called.
 
 ```bash
 decision prune --caller codex -- bash -c 'pytest -q'

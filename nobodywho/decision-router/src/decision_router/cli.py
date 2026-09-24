@@ -6,6 +6,7 @@ decision ask [--json JSON | --file F] [--mode M] [--caller NAME] [--bypass]
 decision jev status | enable | disable              JEV fallback switch (disable is absolute)
 decision stats [--caller NAME] [--since ISO]        usage, tiers, JEV calls, fallbacks
 decision doctor [--live]                           check every provider
+decision benchmark [quality|latency] [...]           explicit local benchmarks (latency: no JEV)
 decision test [--mode M]                           run a canned live decision
 decision ledger [-n N]                             recent receipts
 decision local pull [--tier local|1|2] [--source S]  download + pin a local model
@@ -21,7 +22,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import logging
 import os
 import re
 import shutil
@@ -472,7 +472,7 @@ def _benchmark_pruning(config: dict[str, Any], limit: int, include_jev: bool) ->
                 "nobodywho",
                 provider.model_name,
                 local_judge(provider, timeout_s=settings.get("timeout_s")),
-                max_blocks=int(settings.get("max_blocks", 24)),
+                max_blocks=int(settings.get("max_blocks", 8)),
             )
             pruner = Pruner(
                 [model_tier],
@@ -573,6 +573,12 @@ def _benchmark_pruning(config: dict[str, Any], limit: int, include_jev: bool) ->
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
     config = cfg.load()
+    if args.kind == "latency":
+        from . import latency
+
+        latency_report = latency.run(config, args)
+        print(json.dumps(latency_report, indent=2) if args.json else latency.table(latency_report))
+        return 0 if all(not m.get("error") for m in latency_report["models"]) else 1
     report: dict[str, Any] = {"operation": args.operation, "limit": args.limit or "all"}
     if args.operation in ("all", "decision"):
         report["decision"] = _benchmark_decisions(config, args.limit, args.include_jev)
@@ -963,7 +969,7 @@ def build_pruner(config: dict[str, Any]) -> Pruner:
         tiers.append(
             Tier(int(t), "nobodywho", provider.model_name,
                  local_judge(provider, timeout_s=settings.get("timeout_s")),
-                 max_blocks=int(settings.get("max_blocks", 24)))
+                 max_blocks=int(settings.get("max_blocks", 8)))
         )  # fmt: skip
     jev = JevProvider.from_config(config)
     return Pruner(
@@ -1061,6 +1067,8 @@ def _native_prune_after_error(
         ledger = Ledger(cfg.ledger_path(), caller=caller)
         ledger.write([ledger.prune_receipt(request, result)])
     except Exception as accounting_error:  # noqa: BLE001 - never break the calling tool
+        import logging
+
         logging.getLogger(__name__).debug(
             "Could not write native prune receipt (%s)", type(accounting_error).__name__
         )
@@ -1236,6 +1244,10 @@ def parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_test)
 
     s = sub.add_parser("benchmark", help="explicitly benchmark local decision and pruning models")
+    s.add_argument(
+        "kind", nargs="?", choices=("quality", "latency"), default="quality",
+        help="quality: per-tier answers (default); latency: end-to-end timings per model",
+    )  # fmt: skip
     s.add_argument("--operation", choices=("decision", "prune", "all"), default="all")
     s.add_argument(
         "--limit", type=int, default=0, help="limit each benchmark to the first N fixtures"
@@ -1243,6 +1255,20 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--include-jev", action="store_true", help="only consider JEV if globally enabled"
     )
+    latency = s.add_argument_group("latency (never contacts JEV)")
+    latency.add_argument("--models", nargs="*", metavar="LABEL",
+                         help="configured models to include: local tier1 tier2 (default: all)")  # fmt: skip
+    latency.add_argument("--model", action="append", metavar="GGUF", help="also measure this file")
+    latency.add_argument("--installed", action="store_true", help="every cached GGUF model")
+    latency.add_argument("--calls", type=int, default=20, help="warm decision calls")
+    latency.add_argument("--prune-reps", type=int, default=5,
+                         help="calls per small/medium prune fixture (large: 1)")  # fmt: skip
+    latency.add_argument("--sizes", help="prune sizes, e.g. small,medium (default: all)")
+    latency.add_argument("--budget-s", type=float, default=180,
+                         help="stop repeating an operation after this many seconds")  # fmt: skip
+    latency.add_argument("--timeout-s", type=float, default=600, help="per call")
+    latency.add_argument("--cpu", action="store_true", help="load models without GPU offload")
+    latency.add_argument("--json", action="store_true", help="the full report as JSON")
     s.set_defaults(func=cmd_benchmark)
 
     s = sub.add_parser("ledger", help="show recent receipts")
