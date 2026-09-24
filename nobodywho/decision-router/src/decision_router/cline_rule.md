@@ -18,7 +18,7 @@ If the user says "bypass decision router" or "bypass jev", do not call it for th
 
 ## How
 ```
-decision ask <<'JSON'
+decision ask --caller cline <<'JSON'
 {"question_id":"next_step",
  "state":"<compact evidence only: goal, what was tried, exact error lines, constraints>",
  "question":"<one narrow closed question>",
@@ -29,4 +29,6 @@ JSON
 - 2-6 choices with descriptive snake_case ids (e.g. `inspect_timezone_handling`, not `option_a`), each a concrete next action; include the obvious one (such as retrying unchanged).
 - State: only the evidence needed. No secrets, keys, tokens, env dumps or whole files.
 - Read `follow` in the JSON output. If it is set, take that route unless it conflicts with the user's instructions or safety. If it is null (off, bypass, abstain, error, disagreement), use your own judgement. In shadow mode only `decision` counts; `shadow` is informational.
+- Ask once. The router itself decides which models answer (local first, remote only as a last resort); never re-ask to get a different answer or a different model.
+- Long captured shell output is compacted by the shared `decision prune` adapter. Do not send it to a separate JEV plugin or summarizer.
 - State the chosen route in one line, then continue the ORIGINAL task.

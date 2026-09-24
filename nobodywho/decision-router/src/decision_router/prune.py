@@ -14,6 +14,7 @@ pruning failure never breaks the calling tool.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -21,7 +22,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from .sanitize import redact
 
@@ -31,6 +32,8 @@ DEFAULT_BUDGET_CHARS = 12_000
 BLOCK_PROMPT_CHARS = 900
 KEEP, DROP = "keep", "drop"
 GRAMMAR = f'root ::= "{KEEP}" | "{DROP}"'
+REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+CALLER_ID = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
 SYSTEM_PROMPT = (
     "You triage blocks of a command's output for a software coding agent. "
@@ -56,12 +59,13 @@ CRITICAL = re.compile(
     r"|^\s*(E\s{2,}|FAILED|ERROR|FAIL|---\s+FAIL)"  # pytest / go test failures
     r"|^\s*(\$|>|\#)\s+\S"  # echoed commands and prompts
     r"|^(diff\ --git|index\ \w+\.\.\w+|@@\ |\+\+\+\ |---\ a/|---\ /dev/null)"
-    r"|^\s*\S.*\|\s+\d+\s+[+-]*\s*$"  # git --stat lines
+    r"|^\s*\S.*\|\s+\d+\s*[+-]*\s*$"  # git --stat lines
     r"|\b\d+\s+files?\s+changed\b"
     r"|^\s*(npm|yarn|pnpm)\s+(ERR|WARN)"
     r"|\berror(\[\w+\])?:"
     r"|\bTS\d{4}\b"
     r"|^\s*at\s+\S+\s*\(.*:\d+"  # JS stack frames
+    r"|^\s*(STDOUT|STDERR):\s*$"  # combined command streams
 )
 
 
@@ -83,8 +87,25 @@ class PruneRequest:
             raise ValueError(f"output exceeds {MAX_OUTPUT_CHARS} characters")
         if not isinstance(self.budget_chars, int) or self.budget_chars < MIN_BUDGET_CHARS:
             raise ValueError(f"budget_chars must be an integer >= {MIN_BUDGET_CHARS}")
+        if not isinstance(self.caller, str) or not CALLER_ID.fullmatch(self.caller):
+            raise ValueError("caller must be a short identifier")
+        if not isinstance(self.id, str) or not REQUEST_ID.fullmatch(self.id):
+            raise ValueError("id must be a short request identifier")
+        for field_name, value in (("command", self.command), ("goal", self.goal)):
+            if value is not None and (not isinstance(value, str) or len(value) > 2_000):
+                raise ValueError(f"{field_name} must be text no longer than 2000 characters")
+        if not isinstance(self.preserve, (tuple, list)):
+            raise TypeError("preserve hints must be a list or tuple")
         if any(not isinstance(p, str) or not p for p in self.preserve):
             raise ValueError("preserve hints must be non-empty strings")
+        if not isinstance(self.metadata, dict):
+            raise TypeError("metadata must be an object")
+        try:
+            metadata_size = len(json.dumps(self.metadata, ensure_ascii=False))
+        except (TypeError, ValueError) as error:
+            raise ValueError("metadata must be JSON serializable") from error
+        if metadata_size > 2_000:
+            raise ValueError("metadata exceeds 2000 characters")
 
 
 @dataclass
@@ -103,10 +124,63 @@ class PruneResult:
     fallback_reason: str | None = None
     error: str | None = None
     jev_used: bool = False
+    native_fallback: bool = False
+    compression_ratio: float = 1.0
     attempts: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError("text must be text")
+        if not isinstance(self.provider, str) or not self.provider:
+            raise ValueError("provider must be a non-empty name")
+        for name, value in (
+            ("model", self.model),
+            ("fallback_reason", self.fallback_reason),
+            ("error", self.error),
+        ):
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be text or None")
+        if self.tier is not None and (
+            not isinstance(self.tier, (int, str)) or isinstance(self.tier, bool)
+        ):
+            raise TypeError("tier must be an integer, string, or None")
+        for name in (
+            "original_chars",
+            "result_chars",
+            "original_tokens",
+            "result_tokens",
+            "kept_lines",
+            "total_lines",
+            "latency_ms",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if not isinstance(self.compression_ratio, (int, float)) or isinstance(
+            self.compression_ratio, bool
+        ):
+            raise TypeError("compression_ratio must be numeric")
+        if not 0 <= self.compression_ratio <= 1:
+            raise ValueError("compression_ratio must be within [0, 1]")
+        if not isinstance(self.jev_used, bool) or not isinstance(self.native_fallback, bool):
+            raise TypeError("provider flags must be booleans")
+        if not isinstance(self.attempts, list) or any(
+            not isinstance(a, dict) for a in self.attempts
+        ):
+            raise TypeError("attempts must be a list of objects")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+class _PlanRequest(Protocol):
+    @property
+    def output(self) -> str: ...
+
+    @property
+    def preserve(self) -> tuple[str, ...] | list[str]: ...
 
 
 def estimate_tokens(text: str) -> int:
@@ -136,7 +210,7 @@ def is_repetitive(lines: list[str]) -> bool:
     return len(lines) >= 5 and len({template(line) for line in lines}) <= 2
 
 
-def plan(request: PruneRequest, block_lines: int = 30, context: int = 2,
+def plan(request: _PlanRequest, block_lines: int = 30, context: int = 2,
          head: int = 5, tail: int = 15) -> Plan:  # fmt: skip
     lines = request.output.splitlines()
     n = len(lines)
@@ -228,9 +302,35 @@ def hard_cap(text: str, cap: int) -> str:
     """Last resort when critical lines alone exceed the cap: head and tail, marked."""
     if len(text) <= cap:
         return text
-    half = cap // 2 - 60
-    omitted = len(text) - 2 * half
-    return f"{text[:half]}\n[... {omitted} characters of critical output truncated ...]\n{text[-half:]}"
+    lines = text.splitlines(keepends=True)
+    marker_reserve = 90
+    edge_budget = max(1, (cap - marker_reserve) // 2)
+    head: list[str] = []
+    tail: list[str] = []
+    head_size = 0
+    tail_size = 0
+    for line in lines:
+        if head_size + len(line) > edge_budget:
+            break
+        head.append(line)
+        head_size += len(line)
+    for line in reversed(lines[len(head) :]):
+        if tail_size + len(line) > edge_budget:
+            break
+        tail.insert(0, line)
+        tail_size += len(line)
+    while True:
+        omitted = max(0, len(text) - head_size - tail_size)
+        marker = f"[... {omitted} characters of critical output truncated ...]"
+        separator_before = "" if not head or head[-1].endswith("\n") else "\n"
+        separator_after = "" if not tail or marker.endswith("\n") else "\n"
+        out = "".join(head) + separator_before + marker + separator_after + "".join(tail)
+        if len(out) <= cap or not head and not tail:
+            return out[:cap] if len(out) > cap else out
+        if len(head) >= len(tail) and head:
+            head_size -= len(head.pop())
+        elif tail:
+            tail_size -= len(tail.pop(0))
 
 
 # ---------------------------------------------------------------- engine
@@ -324,6 +424,13 @@ class Pruner:
             label = f"decision prune ({tier.provider})"
             text, keep = fit(p, votes, request.budget_chars, label)
             text = self._finish(hard_cap(text, self._cap(request)), archive, len(keep), p)
+            missing = self._missing_required_facts(request, p, text)
+            if missing:
+                attempts.append({"tier": tier.tier, "provider": tier.provider, "model": tier.model,
+                                 "outcome": "failed", "reason": "pruning_quality_failure",
+                                 "missing_facts": len(missing), "latency_ms": _ms(t0)})  # fmt: skip
+                previous_reason = "pruning_quality_failure"
+                continue
             attempts.append({"tier": tier.tier, "provider": tier.provider, "model": tier.model,
                              "outcome": "accepted", "judged_blocks": len(candidates),
                              "dropped_blocks": sum(v == DROP for v in votes.values()),
@@ -350,11 +457,22 @@ class Pruner:
             result(
                 text=text, provider="native", tier="native", kept_lines=len(keep),
                 fallback_reason=previous_reason or "no_provider", attempts=attempts,
+                native_fallback=True,
                 jev_used=any(a.get("provider") == "jev" and a["outcome"] != "skipped"
                              for a in attempts),
             ),
             started, len(keep),
         )  # fmt: skip
+
+    @staticmethod
+    def _missing_required_facts(request: PruneRequest, p: Plan, text: str) -> list[str]:
+        hints = tuple(hint.lower() for hint in request.preserve)
+        required = {
+            line
+            for line in p.lines
+            if CRITICAL.search(line) or any(hint in line.lower() for hint in hints)
+        }
+        return [line for line in required if line and line not in text]
 
     def _cap(self, request: PruneRequest) -> int:
         return int(request.budget_chars * self.hard_cap_factor)
@@ -367,7 +485,7 @@ class Pruner:
             path = self.archive_dir / f"{request.caller}-{request.id}.txt"
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(request.output)
+                f.write(redact(request.output, self.secret_literals))
             old = sorted(self.archive_dir.glob("*.txt"), key=lambda q: q.stat().st_mtime)
             for stale in old[:-200]:
                 stale.unlink(missing_ok=True)
@@ -380,13 +498,18 @@ class Pruner:
         original = "\n".join(p.lines)
         where = f"; full output: {archive}" if archive else ""
         out = f"{text}\n[decision prune: kept {kept} of {len(p.lines)} lines{where}]"
-        return original if len(out) >= len(original) else out
+        if len(out) < len(original):
+            return out
+        return text if len(text) <= len(original) else original
 
     def _done(self, result: PruneResult, started: float, kept: int) -> PruneResult:
         result.result_chars = len(result.text)
         result.result_tokens = estimate_tokens(result.text)
         result.kept_lines = kept
         result.latency_ms = _ms(started)
+        result.compression_ratio = (
+            round(result.result_chars / result.original_chars, 4) if result.original_chars else 1.0
+        )
         if result.error:
             result.error = redact(result.error, self.secret_literals)[:200]
         return result

@@ -1,13 +1,18 @@
 # decision-router (experimental)
 
-An experimental, provider-neutral decision layer for coding agents. The agent asks one narrow, closed
-routing question ("which of these next steps?"). The router sends the same sanitized request to one of
-two interchangeable backends and returns a normalized, receipted answer:
+An experimental, provider-neutral support layer for coding agents. The coding client still performs
+the coding task. For a narrow, closed routing question ("which of these next steps?"), the shared
+router sends the same sanitized request through local tiers first and returns a normalized, receipted
+answer:
 
 | Provider    | What it is                                                              | Cost                                     | Confidence reported                      |
 | ----------- | ----------------------------------------------------------------------- | ---------------------------------------- | ---------------------------------------- |
 | `jev`       | TypeSafe JEV, a hosted decision model (`api.typesafe.ai/v1/systemone`)  | TypeSafe API usage                       | `calibrated_probability` (from TypeSafe) |
 | `nobodywho` | A local open-weight GGUF model run by NobodyWho, fully offline          | No inference API fee; uses local CPU/GPU | `sample_stability` (a proxy, see below)  |
+
+Production mode is `local-first`: NobodyWho Tier 1, NobodyWho Tier 2 when Tier 1 is unacceptable,
+then JEV only when both local tiers fail and the global JEV switch is enabled. The default config
+keeps that switch off.
 
 This lives in a fork of [NobodyWho](https://github.com/nobodywho-ooo/nobodywho) as an isolated Python
 package. It does not change NobodyWho's inference core or bindings. It only uses the public
@@ -44,9 +49,12 @@ threshold them against each other.
 | `local`   | NobodyWho only. The zero-API-cost mode.                                                                                        |
 | `shadow`  | JEV is authoritative. NobodyWho gets the identical request, is recorded, and can never set `follow`, even when JEV fails.     |
 | `compare` | Both run. `follow` is set only when they agree; on disagreement it is `null` and the note names both answers.                 |
+| `local-first` | NobodyWho Tier 1, then Tier 2 for an unacceptable result, then JEV only when both local tiers fail and JEV is enabled. |
 
-There is deliberately **no automatic local → JEV escalation**. That needs benchmark evidence from
-`shadow`/`compare` receipts first.
+The local-first acceptance policy uses `sample_stability`, never a calibrated probability. It
+escalates for provider errors, timeouts, invalid output, abstention, no valid choice, insufficient
+evidence, or stability below the configured threshold. Disagreement or a surprising answer alone
+does not trigger another tier.
 
 ## Install
 
@@ -57,7 +65,7 @@ ln -s ~/.local/share/decision-router/venv/bin/decision ~/.local/bin/decision
 
 decision local pull      # downloads + pins the default local model (sha256 recorded)
 decision install-rule    # installs the Cline rule into ~/.cline/rules/
-decision doctor --live   # checks both providers with one real call each
+decision doctor          # checks configuration and local model availability without live calls
 ```
 
 The default local model is NobodyWho's own test model, `NobodyWho/Qwen_Qwen3-0.6B-GGUF`
@@ -103,8 +111,16 @@ decision provider jev
 decision provider local      # local-only, no inference API fee
 decision provider shadow     # JEV decides, local is compared silently
 decision provider compare    # explicit A/B testing
+decision provider local-first
+decision jev status          # global TypeSafe kill switch state
+decision jev disable         # hard block on TypeSafe calls in every mode
+decision benchmark           # explicit local decision and pruning benchmark
 DECISION_ROUTER_MODE=local decision ask ...   # one-off override
 ```
+
+`decision provider` prints both the decision and pruning tiers. Use `decision jev enable` only when
+TypeSafe fallback is intentionally allowed. `decision jev disable` blocks it centrally even if a
+client still has an old disabled plugin on disk.
 
 ## Asking
 
@@ -128,6 +144,22 @@ never as a crash.
 Contract limits: 2-12 snake_case choices, `ABSTAIN` reserved, `risk` in `low|medium|high`, state under
 16k characters. Unknown fields are rejected.
 
+## Pruning command output
+
+`decision prune` is a separate operation from `decision ask`. It keeps command output extractive,
+preserves error text, file and line references, test failures, commands, warnings, diff headers and
+counts, and marks omitted spans. It tries Tier 1, Tier 2 after a quality or provider failure, JEV
+only after both local tiers fail and the global switch is on, then native bounded truncation. A prune
+failure never changes the command's exit status or stderr.
+
+```bash
+decision prune --caller codex -- bash -c 'pytest -q'
+```
+
+The one user config is `~/.config/decision-router/config.json`; all client adapters use the same
+router and append metadata-only receipts to `~/.local/state/decision-router/ledger.jsonl`. Original
+command output archives are off by default because logs can contain credentials.
+
 ## Safety properties
 
 - **Advisory only.** The router never executes anything. Permissions and execution stay with
@@ -136,8 +168,9 @@ Contract limits: 2-12 snake_case choices, `ABSTAIN` reserved, `risk` in `low|med
   "bypass decision router" / "bypass jev" calls no provider.
 - **No recursion.** Calls made while a decision is in flight are refused (`DECISION_ROUTER_ACTIVE`).
   So are questions about whether to use the router itself.
-- **Secrets.** The TypeSafe key is read at call time from `~/.config/jev/typesafe.key` (or
-  `TYPESAFE_API_KEY`) and only placed in the `Authorization` header. The key and common token
+- **Secrets.** Only the shared router reads the TypeSafe key from `~/.config/jev/typesafe.key` (or
+  `TYPESAFE_API_KEY`) when JEV is enabled and actually invoked. Coding client launchers remove that
+  environment variable. The key and common token
   patterns are redacted from everything a provider sees and from every receipt. The local worker
   subprocess does not inherit the key.
 - **Bounded.** JEV calls have a request timeout. Local inference runs in a separate worker process
@@ -176,5 +209,3 @@ Everything here is confined to `nobodywho/decision-router/`, so upstream merges 
 
 NobodyWho is © the NobodyWho contributors and licensed under the [EUPL-1.2](../../LICENSE). This
 package is part of a fork of it and is distributed under the same EUPL-1.2 licence.
-
-Built by Cobalt

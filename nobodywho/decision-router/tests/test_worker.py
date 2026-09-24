@@ -149,3 +149,38 @@ def test_real_model_is_loaded_once():
     assert second.details["model_reused"] is True
     assert second.details["load_ms"] < first.details["load_ms"]
     assert first.votes and second.votes
+
+
+def _tier_config(tmp_path, tier1_gpu: bool):
+    dummy = tmp_path / "dummy.gguf"
+    dummy.write_bytes(b"GGUF")
+    config = cfg.load()
+    config["tiers"]["1"].update(model_path="/nonexistent/t1.gguf", use_gpu=tier1_gpu)
+    config["tiers"]["2"].update(model_path=str(dummy), timeout_s=20)
+    return config
+
+
+def test_tier2_cold_start_evicts_gpu_tier1(tmp_path):
+    config = _tier_config(tmp_path, tier1_gpu=True)
+    tier1 = NobodyWhoProvider.for_tier(config, "1").runner
+    assert isinstance(tier1, PersistentWorker)
+    tier1(MISSING_MODEL_JOB, 10)  # tier 1 worker is now resident
+    assert tier1.pid() is not None
+    tier2 = NobodyWhoProvider.for_tier(config, "2")
+    tier2.decide(make_request())  # dummy model fails to load; eviction happens first
+    assert tier1.pid() is None
+
+
+def test_warm_tier2_or_cpu_tier1_is_not_evicted(tmp_path):
+    config = _tier_config(tmp_path, tier1_gpu=False)
+    tier1 = NobodyWhoProvider.for_tier(config, "1").runner
+    assert isinstance(tier1, PersistentWorker)
+    tier1(MISSING_MODEL_JOB, 10)
+    assert NobodyWhoProvider.for_tier(config, "2").evict == []
+    config = _tier_config(tmp_path, tier1_gpu=True)
+    tier2 = NobodyWhoProvider.for_tier(config, "2")
+    runner = tier2.runner
+    assert isinstance(runner, PersistentWorker)
+    runner(MISSING_MODEL_JOB, 10)  # tier 2 already warm
+    tier2._make_room()
+    assert tier1.pid() is not None

@@ -33,12 +33,53 @@ def run(capsys, *argv):
 
 def test_provider_switching(capsys):
     code, out = run(capsys, "provider")
-    assert code == 0 and out.out.startswith("mode: jev")
+    assert code == 0 and out.out.startswith("mode: local-first")
     for mode in ("off", "local", "shadow", "compare", "local-first", "jev"):
         assert run(capsys, "provider", mode)[0] == 0
         assert json.loads(cfg.config_path().read_text())["mode"] == mode
         assert run(capsys, "provider")[1].out.startswith(f"mode: {mode} ")
     assert cfg.config_path().stat().st_mode & 0o077 == 0
+
+
+def test_local_first_provider_shows_both_operation_chains(capsys):
+    run(capsys, "provider", "local-first")
+    shown = run(capsys, "provider")[1].out
+    assert "decision:" in shown and "pruning:" in shown
+    assert "final fallback: native truncation" in shown
+    assert "tier 3 dormant unless enabled after both local tiers fail" in shown
+
+
+def test_benchmark_is_an_explicit_command_and_routes_both_reports(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(cli.cfg, "load", lambda: {"mode": "local-first"})
+    monkeypatch.setattr(
+        cli,
+        "_benchmark_decisions",
+        lambda config, limit, jev: calls.append(("ask", limit, jev)) or {"tiers": {}},
+    )
+    monkeypatch.setattr(
+        cli,
+        "_benchmark_pruning",
+        lambda config, limit, jev: calls.append(("prune", limit, jev)) or {"tiers": {}},
+    )
+    assert cli.main(["benchmark", "--limit", "2", "--include-jev"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["decision"]["tiers"] == {} and report["prune"]["tiers"] == {}
+    assert calls == [("ask", 2, True), ("prune", 2, True)]
+
+
+def test_benchmark_agreement_excludes_failed_tier_outputs():
+    report = cli._tier_agreement(
+        {
+            "1": [{"choice": None, "error": "worker failed"}, {"choice": "a"}],
+            "2": [{"choice": None, "error": "worker failed"}, {"choice": "b"}],
+        }
+    )
+    assert report == {
+        "tier_comparable_cases": 1,
+        "tier_agreement": 0,
+        "tier_disagreement": 1,
+    }
 
 
 def test_provider_rejects_unknown_mode(capsys):
@@ -76,7 +117,7 @@ def test_ask_invalid_request_is_reported_not_raised(capsys):
 
 
 def test_ask_jev_without_key_fails_safe(capsys, tmp_path):
-    cfg.update({"mode": "jev", "jev": {"key_file": str(tmp_path / "missing.key")}})
+    cfg.update({"mode": "jev", "jev": {"key_file": str(tmp_path / "missing.key"), "enabled": True}})
     code, out = run(capsys, "ask", "--json", json.dumps(REQUEST))
     data = json.loads(out.out)
     assert code == 0 and data["follow"] is None

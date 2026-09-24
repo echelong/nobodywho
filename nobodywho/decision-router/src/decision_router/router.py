@@ -349,7 +349,8 @@ class Router:
                     break  # retrying cannot fix a broken or missing model
             if final is not None:
                 break
-            previous = (f"{result.provider}/{result.model or 'unknown'}", why or "provider_error")
+            label = result.model or getattr(provider, "model_name", None) or "unknown"
+            previous = (f"{result.provider}/{label}", why or "provider_error")
 
         if final is None:
             result = self._call("jev", request)

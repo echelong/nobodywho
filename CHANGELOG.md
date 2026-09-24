@@ -10,6 +10,7 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ### Added
 
+- **Decision router:** Added local-first decision routing and coding-output pruning with shared caller adapters, a global JEV kill switch, and deterministic native truncation fallback.
 - **Python:** Added OpenAI-compatible `chat.completions` and `responses` APIs with streaming, usage metadata, tool support, and request-level sampling.
 - Loaded models expose the identifier used to load them through a read-only `source` property. Available for all bindings.
 - `SamplerBuilder` gained `constrain_with_json_schema`, `constrain_with_regex`, `constrain_with_grammar` and `json`, so a constraint can be combined with a temperature or a repetition penalty — the equivalent `SamplerPresets` each produce a finished sampler and cannot be layered. Available for all bindings.

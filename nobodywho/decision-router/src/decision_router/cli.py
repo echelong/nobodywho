@@ -12,6 +12,7 @@ decision local pull [--tier local|1|2] [--source S]  download + pin a local mode
 decision prune [--caller NAME] [--budget-chars N] [--goal T] [--command C] [--json]
                [-- COMMAND ARGS...]              shorten long output (stdin, or run COMMAND)
 decision prune status | test                     pruning configuration / corpus self-test
+decision adapter shim CALLER                     write the bash shim a tool uses for pruning
 decision install-rule [--dest DIR]                 install the Cline rule
 """
 
@@ -20,7 +21,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -35,7 +38,18 @@ from .contract import DecisionRequest, RequestError
 from .ledger import Ledger
 from .providers import JevProvider, NobodyWhoProvider
 from .providers.nobodywho import PersistentWorker
-from .prune import Pruner, PruneRequest, Tier
+from .prune import (
+    MAX_OUTPUT_CHARS,
+    MIN_BUDGET_CHARS,
+    Pruner,
+    PruneRequest,
+    PruneResult,
+    Tier,
+    estimate_tokens,
+    fit,
+    hard_cap,
+    plan,
+)
 from .prune_providers import jev_judge, local_judge
 from .router import Router
 
@@ -84,21 +98,29 @@ def describe_mode(config: dict[str, Any]) -> str:
     lines = [f"mode: {mode}  (from {source})"]
     jev_state = "disabled (hard: never called)" if not jev_enabled(config) else "enabled"
     if mode == "local-first":
+        tier_labels = {}
+        lines.append("decision:")
         for tier in cfg.TIER_NAMES:
             t = cfg.tier_settings(config, tier)
+            tier_labels[tier] = f"nobodywho / {_model_label(t)}"
             lifecycle = (
                 f"persistent worker, idle exit {t.get('idle_timeout_s'):g}s"
                 if t.get("persistent")
                 else "loaded per decision"
             )
-            lines += [
-                f"tier {tier}:",
-                "  nobodywho",
-                f"  {_model_label(t)}",
-                f"  gpu={bool(t.get('use_gpu'))}, {lifecycle}",
-            ]
-        lines += ["tier 3:", "  typesafe", f"  {config['jev']['model']}"]
-        lines += ["jev:", f"  {'dormant (fallback only)' if jev_enabled(config) else jev_state}"]
+            lines.append(
+                f"  tier {tier}: {tier_labels[tier]} ({lifecycle}, gpu={bool(t.get('use_gpu'))})"
+            )
+        lines += [
+            "  tier 3: typesafe / " + config["jev"]["model"],
+            "pruning:",
+            f"  tier 1: {tier_labels['1']}",
+            f"  tier 2: {tier_labels['2']}",
+            "  tier 3: typesafe / " + config["jev"]["model"],
+            "  final fallback: native truncation",
+            "JEV:",
+            f"  {'dormant unless both local tiers fail' if jev_enabled(config) else jev_state + '; tier 3 dormant unless enabled after both local tiers fail'}",
+        ]
     elif mode in ("jev", "shadow", "compare"):
         lines += [f"jev: {jev_state}"]
     return "\n".join(lines)
@@ -181,6 +203,382 @@ def cmd_test(args: argparse.Namespace) -> int:
     request = DecisionRequest.from_dict(dict(SAMPLE_REQUEST, id=f"selftest-{os.getpid()}"))
     outcome = build_router(config).route(request, mode)
     print(json.dumps(outcome.to_dict(), indent=2))
+    return 0
+
+
+def _median(values: list[int]) -> int | None:
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2] if ordered else None
+
+
+def _tier_agreement(per_model: dict[str, list[dict[str, Any]]]) -> dict[str, int]:
+    pairs = [
+        (tier1.get("choice"), tier2.get("choice"))
+        for tier1, tier2 in zip(per_model.get("1", []), per_model.get("2", []))
+        if tier1.get("choice") is not None
+        and tier2.get("choice") is not None
+        and not tier1.get("error")
+        and not tier2.get("error")
+    ]
+    disagreements = sum(left != right for left, right in pairs)
+    return {
+        "tier_comparable_cases": len(pairs),
+        "tier_agreement": len(pairs) - disagreements,
+        "tier_disagreement": disagreements,
+    }
+
+
+def _worker_metrics(provider: NobodyWhoProvider) -> dict[str, Any]:
+    runner = provider.runner
+    if not isinstance(runner, PersistentWorker):
+        return {"worker": "oneshot", "ram_rss_mib": None, "gpu_offload": "not observable"}
+    pid = runner.pid()
+    rss_mib = None
+    if pid:
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    rss_mib = round(int(line.split()[1]) / 1024, 1)
+                    break
+        except (OSError, ValueError):
+            pass
+    offload: str | None = None
+    gpu_load_error: str | None = None
+    try:
+        if runner.log_path.is_file():
+            log = runner.log_path.read_text(errors="replace")
+            match = re.search(r"offload(?:ed|ing)?\s+(\d+)/(\d+)\s+layers", log, re.IGNORECASE)
+            if match:
+                offload = f"{match.group(1)}/{match.group(2)} layers"
+            if re.search(r"ErrorOutOfDeviceMemory|out of device memory", log, re.IGNORECASE):
+                gpu_load_error = "out of device memory"
+    except OSError:
+        pass
+    try:
+        gpu = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        gpu_memory = (
+            gpu.stdout.strip().splitlines()[0]
+            if gpu.returncode == 0 and gpu.stdout.strip()
+            else None
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        gpu_memory = None
+    if offload is None:
+        offload = "not observed in worker log" if provider.use_gpu else "CPU configured"
+    return {
+        "worker": "persistent",
+        "worker_pid": pid,
+        "ram_rss_mib": rss_mib,
+        "gpu_memory_used_total_mib": gpu_memory,
+        "gpu_offload": offload,
+        "gpu_load_error": gpu_load_error,
+        "worker_log": str(runner.log_path) if runner.log_path.is_file() else None,
+    }
+
+
+def _benchmark_decisions(config: dict[str, Any], limit: int, include_jev: bool) -> dict[str, Any]:
+    from .benchmark import CASES
+
+    cases = CASES[:limit] if limit else CASES
+    results_by_tier: dict[str, dict[str, Any]] = {}
+    per_model: dict[str, list[dict[str, Any]]] = {}
+    # Tier 2 runs first; tier 1 is left resident when the benchmark completes.
+    old_capture = os.environ.get("DECISION_ROUTER_CAPTURE_WORKER_LOG")
+    os.environ["DECISION_ROUTER_CAPTURE_WORKER_LOG"] = "1"
+    try:
+        for tier in reversed(cfg.TIER_NAMES):
+            provider = NobodyWhoProvider.for_tier(config, tier)
+            ready, reason = provider.available()
+            if not ready:
+                results_by_tier[tier] = {"status": "unavailable", "reason": reason}
+                continue
+            rows: list[dict[str, Any]] = []
+            for index, case in enumerate(cases):
+                request = DecisionRequest.from_dict(
+                    {
+                        "id": f"bench-{tier}-{index:02d}",
+                        "question_id": "benchmark",
+                        "state": case["state"],
+                        "question": case["question"],
+                        "choices": case["choices"],
+                        "allow_abstain": True,
+                        "risk": "low",
+                    }
+                )
+                result = provider.decide(request)
+                chosen = "ABSTAIN" if result.abstain else result.choice
+                expected = case.get("expected")
+                correct = None if expected is None else chosen == expected
+                row = {
+                    "case": case["kind"],
+                    "choice": chosen,
+                    "expected": expected,
+                    "correct": correct,
+                    "error": result.error,
+                    "fallback_reason": result.fallback_reason,
+                    "confidence": result.confidence,
+                    "confidence_kind": result.confidence_kind,
+                    "latency_ms": result.latency_ms,
+                    "sample_ms": result.details.get("sample_ms"),
+                    "cold_load_ms": result.details.get("load_ms")
+                    if result.details.get("model_reused") is False
+                    else None,
+                    "model_reused": result.details.get("model_reused"),
+                }
+                rows.append(row)
+            per_model[tier] = rows
+            latencies = [r["latency_ms"] for r in rows if isinstance(r.get("latency_ms"), int)]
+            sample_latencies = [
+                value
+                for r in rows
+                for value in (r.get("sample_ms") or [])
+                if isinstance(value, int)
+            ]
+            stability = [
+                r["confidence"]
+                for r in rows
+                if r.get("confidence_kind") == "sample_stability"
+                and isinstance(r.get("confidence"), (int, float))
+            ]
+            objective = [r["correct"] for r in rows if r.get("correct") is not None]
+            results_by_tier[tier] = {
+                "status": "complete"
+                if rows and not all(r.get("error") for r in rows)
+                else "failed",
+                "model": provider.model_name,
+                "correct": sum(value is True for value in objective),
+                "objective_cases": len(objective),
+                "incorrect": sum(value is False for value in objective),
+                "abstentions": sum(r.get("choice") == "ABSTAIN" for r in rows),
+                "mean_sample_stability": round(sum(stability) / len(stability), 4)
+                if stability
+                else None,
+                "median_total_latency_ms": _median(latencies),
+                "median_sample_latency_ms": _median(sample_latencies),
+                "cold_load_ms": next(
+                    (r["cold_load_ms"] for r in rows if r.get("cold_load_ms") is not None), None
+                ),
+                "warm_total_latency_ms": _median(
+                    [
+                        r["latency_ms"]
+                        for r in rows
+                        if r.get("model_reused") is True and isinstance(r.get("latency_ms"), int)
+                    ]
+                ),
+                "hardware": _worker_metrics(provider),
+                "cases": rows,
+            }
+    finally:
+        if old_capture is None:
+            os.environ.pop("DECISION_ROUTER_CAPTURE_WORKER_LOG", None)
+        else:
+            os.environ["DECISION_ROUTER_CAPTURE_WORKER_LOG"] = old_capture
+
+    agreement = _tier_agreement(per_model)
+    jev_report: dict[str, Any] | str = "not requested"
+    if include_jev:
+        if not jev_enabled(config):
+            jev_report = "skipped: global JEV switch is disabled"
+        else:
+            jev = JevProvider.from_config(config)
+            available, why = jev.available()
+            if not available:
+                jev_report = {"status": "unavailable", "reason": why, "calls": 0}
+            else:
+                rows = []
+                for index, case in enumerate(cases):
+                    request = DecisionRequest.from_dict(
+                        {
+                            "id": f"bench-jev-{index:02d}",
+                            "question_id": "benchmark",
+                            "state": case["state"],
+                            "question": case["question"],
+                            "choices": case["choices"],
+                            "allow_abstain": True,
+                            "risk": "low",
+                        }
+                    )
+                    result = jev.decide(request)
+                    chosen = "ABSTAIN" if result.abstain else result.choice
+                    expected = case.get("expected")
+                    rows.append(
+                        {
+                            "case": case["kind"],
+                            "choice": chosen,
+                            "expected": expected,
+                            "correct": None if expected is None else chosen == expected,
+                            "error": result.error,
+                            "confidence": result.confidence,
+                            "confidence_kind": result.confidence_kind,
+                            "latency_ms": result.latency_ms,
+                        }
+                    )
+                outcomes = [row["correct"] for row in rows if row["correct"] is not None]
+                jev_report = {
+                    "status": "complete",
+                    "calls": len(rows),
+                    "correct": sum(value is True for value in outcomes),
+                    "objective_cases": len(outcomes),
+                    "incorrect": sum(value is False for value in outcomes),
+                    "abstentions": sum(row["choice"] == "ABSTAIN" for row in rows),
+                    "median_latency_ms": _median(
+                        [
+                            row["latency_ms"]
+                            for row in rows
+                            if isinstance(row.get("latency_ms"), int)
+                        ]
+                    ),
+                    "cases": rows,
+                }
+
+    outcome: dict[str, Any] = {
+        "cases_run": len(cases),
+        "tiers": results_by_tier,
+        **agreement,
+        "jev": jev_report,
+    }
+    return outcome
+
+
+def _benchmark_pruning(config: dict[str, Any], limit: int, include_jev: bool) -> dict[str, Any]:
+    from .prune_corpus import cases as fixture_cases
+
+    corpus = fixture_cases()
+    if limit:
+        corpus = corpus[:limit]
+    pc = config["prune"]
+    by_tier: dict[str, Any] = {}
+    old_capture = os.environ.get("DECISION_ROUTER_CAPTURE_WORKER_LOG")
+    os.environ["DECISION_ROUTER_CAPTURE_WORKER_LOG"] = "1"
+    try:
+        for tier_name in reversed(cfg.TIER_NAMES):
+            settings = pc.get(f"tier{tier_name}", {})
+            provider = NobodyWhoProvider.for_tier(config, tier_name)
+            ready, reason = provider.available()
+            if not ready or settings.get("enabled", True) is False:
+                by_tier[tier_name] = {
+                    "status": "unavailable",
+                    "reason": reason if not ready else "disabled",
+                }
+                continue
+            model_tier = Tier(
+                int(tier_name),
+                "nobodywho",
+                provider.model_name,
+                local_judge(provider, timeout_s=settings.get("timeout_s")),
+                max_blocks=int(settings.get("max_blocks", 24)),
+            )
+            pruner = Pruner(
+                [model_tier],
+                jev_enabled=False,
+                block_lines=int(pc.get("block_lines", 30)),
+                hard_cap_factor=float(pc.get("hard_cap_factor", 2.0)),
+                archive_dir=None,
+            )
+            rows: list[dict[str, Any]] = []
+            for name, command, output, required in corpus:
+                request = PruneRequest(
+                    output=output,
+                    caller="benchmark",
+                    command=command,
+                    budget_chars=int(pc.get("budget_chars", 12_000)),
+                )
+                result = pruner.prune(request)
+                missing = [fact for fact in required if fact not in result.text]
+                source_lines = output.splitlines()
+                hallucinated = [
+                    line
+                    for line in result.text.splitlines()
+                    if not line.startswith("[... ")
+                    and not line.startswith("[decision prune:")
+                    and line not in source_lines
+                    and line not in output
+                ]
+                rows.append(
+                    {
+                        "fixture": name,
+                        "provider": result.provider,
+                        "latency_ms": result.latency_ms,
+                        "compression_ratio": result.compression_ratio,
+                        "required_facts": len(required),
+                        "retained_facts": len(required) - len(missing),
+                        "missing_facts": missing,
+                        "hallucinated_lines": len(hallucinated),
+                        "native_fallback": result.native_fallback,
+                    }
+                )
+            successful = [r for r in rows if r["provider"] == "nobodywho"]
+            ratios = [float(r["compression_ratio"]) for r in rows]
+            by_tier[tier_name] = {
+                "status": "complete",
+                "model": provider.model_name,
+                "fixtures_run": len(rows),
+                "provider_successes": len(successful),
+                "required_facts_retained": sum(r["retained_facts"] for r in rows),
+                "required_facts_total": sum(r["required_facts"] for r in rows),
+                "hallucinated_lines": sum(r["hallucinated_lines"] for r in rows),
+                "mean_compression_ratio": round(sum(ratios) / len(ratios), 4) if ratios else None,
+                "median_latency_ms": _median([int(r["latency_ms"]) for r in rows]),
+                "hardware": _worker_metrics(provider),
+                "fixtures": rows,
+                "jev_calls": pruner.jev_calls,
+            }
+    finally:
+        if old_capture is None:
+            os.environ.pop("DECISION_ROUTER_CAPTURE_WORKER_LOG", None)
+        else:
+            os.environ["DECISION_ROUTER_CAPTURE_WORKER_LOG"] = old_capture
+
+    jev_report: dict[str, Any] | str = "not requested"
+    if include_jev:
+        if not jev_enabled(config):
+            jev_report = "skipped: global JEV switch is disabled"
+        else:
+            chained = build_pruner(config)
+            local_first_rows = []
+            for name, command, output, required in corpus:
+                request = PruneRequest(
+                    output=output,
+                    caller="benchmark",
+                    command=command,
+                    budget_chars=int(pc.get("budget_chars", 12_000)),
+                )
+                result = chained.prune(request)
+                local_first_rows.append(
+                    {
+                        "fixture": name,
+                        "provider": result.provider,
+                        "tier": result.tier,
+                        "required_facts": len(required),
+                        "retained_facts": sum(fact in result.text for fact in required),
+                        "native_fallback": result.native_fallback,
+                        "fallback_reason": result.fallback_reason,
+                        "jev_used": result.jev_used,
+                    }
+                )
+            jev_report = {
+                "status": "complete",
+                "calls": chained.jev_calls,
+                "local_first": local_first_rows,
+            }
+    result: dict[str, Any] = {"tiers": by_tier, "jev": jev_report}
+    return result
+
+
+def cmd_benchmark(args: argparse.Namespace) -> int:
+    config = cfg.load()
+    report: dict[str, Any] = {"operation": args.operation, "limit": args.limit or "all"}
+    if args.operation in ("all", "decision"):
+        report["decision"] = _benchmark_decisions(config, args.limit, args.include_jev)
+    if args.operation in ("all", "prune"):
+        report["prune"] = _benchmark_pruning(config, args.limit, args.include_jev)
+    print(json.dumps(report, indent=2))
     return 0
 
 
@@ -326,23 +724,44 @@ def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
-    by_caller: dict[str, dict[str, int]] = {}
+    by_caller: dict[str, dict[str, Any]] = {}
     providers: dict[str, int] = {}
     fallbacks: dict[str, int] = {}
     latencies: list[int] = []
     for r in records:
         c = by_caller.setdefault(str(r.get("caller", "unknown")),
-                                 {"calls": 0, "chars_in": 0, "chars_out": 0, "jev_used": 0})  # fmt: skip
+                                 {"calls": 0, "chars_in": 0, "chars_out": 0,
+                                  "tier1_success": 0, "tier2_escalation": 0,
+                                  "jev_fallback": 0, "native_truncation": 0,
+                                  "latencies_ms": []})  # fmt: skip
         c["calls"] += 1
         c["chars_in"] += int(r.get("original_chars") or 0)
         c["chars_out"] += int(r.get("result_chars") or 0)
-        c["jev_used"] += bool(r.get("jev_used"))
+        raw_attempts = r.get("attempts")
+        attempts: list[dict[str, Any]] = (
+            [a for a in raw_attempts if isinstance(a, dict)]
+            if isinstance(raw_attempts, list)
+            else []
+        )
+        reached_tier2 = any(
+            a.get("provider") == "nobodywho" and a.get("tier") == 2 for a in attempts
+        )
+        c["tier1_success"] += r.get("provider") == "nobodywho" and r.get("tier") == 1
+        c["tier2_escalation"] += (
+            r.get("provider") == "nobodywho" and r.get("tier") == 2
+        ) or reached_tier2
+        c["jev_fallback"] += bool(r.get("jev_used"))
+        c["native_truncation"] += bool(r.get("native_fallback")) or r.get("provider") == "native"
         key = f"{r.get('provider')}/tier{r.get('tier')}"
         providers[key] = providers.get(key, 0) + 1
         if r.get("fallback_reason"):
             fallbacks[r["fallback_reason"]] = fallbacks.get(r["fallback_reason"], 0) + 1
         if isinstance(r.get("latency_ms"), int) and r.get("provider") not in ("none",):
             latencies.append(r["latency_ms"])
+            c["latencies_ms"].append(r["latency_ms"])
+    for c in by_caller.values():
+        samples = sorted(c.pop("latencies_ms"))
+        c["median_latency_ms"] = samples[len(samples) // 2] if samples else None
     return {
         "calls": len(records),
         "by_caller": by_caller,
@@ -367,13 +786,23 @@ def summarize_asks(records: list[dict[str, Any]]) -> dict[str, Any]:
                 out[str(value)] = out.get(str(value), 0) + 1
         return dict(sorted(out.items(), key=lambda kv: -kv[1]))
 
-    by_caller: dict[str, dict[str, int]] = {}
+    by_caller: dict[str, dict[str, Any]] = {}
     final_tier: dict[str, int] = {}
     jev_calls = local_first = 0
     latencies: dict[str, list[int]] = {}
     for rows in decisions.values():
         caller = str(rows[0].get("caller", "unknown"))
-        stats = by_caller.setdefault(caller, {"decisions": 0, "skipped": 0, "jev_calls": 0})
+        stats = by_caller.setdefault(
+            caller,
+            {
+                "decisions": 0,
+                "skipped": 0,
+                "jev_calls": 0,
+                "tier1_success": 0,
+                "tier2_escalation": 0,
+                "tier3_fallback": 0,
+            },
+        )
         stats["decisions"] += 1
         stats["skipped"] += any(r.get("skipped") for r in rows)
         calls = sum(
@@ -389,6 +818,13 @@ def summarize_asks(records: list[dict[str, Any]]) -> dict[str, Any]:
             accepted = [r["tier"] for r in lf if r.get("accepted")]
             key = f"tier{accepted[0]}" if accepted else "none"
             final_tier[key] = final_tier.get(key, 0) + 1
+            if accepted:
+                if accepted[0] == 1:
+                    stats["tier1_success"] += 1
+                elif accepted[0] == 2:
+                    stats["tier2_escalation"] += 1
+                else:
+                    stats["tier3_fallback"] += 1
         for r in rows:
             if isinstance(r.get("latency_ms"), int) and r.get("provider"):
                 latencies.setdefault(
@@ -557,8 +993,78 @@ def _prune_text(args: argparse.Namespace, config: dict[str, Any], text: str) -> 
         ledger = Ledger(cfg.ledger_path(), literals, request.caller)
         ledger.write([ledger.prune_receipt(request, result)])
         return result.text, result
-    except Exception:  # noqa: BLE001 - pruning must never break the calling tool
-        return text, None
+    except Exception as error:  # noqa: BLE001 - pruning must never break the calling tool
+        return _native_prune_after_error(text, args, config, error)
+
+
+def _native_prune_after_error(
+    text: str, args: argparse.Namespace, config: dict[str, Any], error: Exception
+) -> tuple[str, PruneResult]:
+    """A broken provider/config still gets a deterministic, bounded native excerpt."""
+    try:
+        budget = max(
+            MIN_BUDGET_CHARS,
+            int(args.budget_chars or config["prune"]["budget_chars"]),
+        )
+    except (TypeError, ValueError, KeyError):
+        budget = MIN_BUDGET_CHARS
+    caller = caller_name(args.caller)
+    request: Any
+    if len(text) <= MAX_OUTPUT_CHARS:
+        request = PruneRequest(
+            output=text,
+            caller=caller,
+            budget_chars=budget,
+        )
+    else:
+        from types import SimpleNamespace
+
+        request = SimpleNamespace(
+            output=text, preserve=(), caller=caller, command=None, id=os.urandom(8).hex()
+        )
+    pc = config.get("prune", {}) if isinstance(config, dict) else {}
+    block_lines = int(pc.get("block_lines", 30))
+    p = plan(request, block_lines)
+    votes = {block: "drop" for block in p.blocks}
+    if p.blocks:
+        votes[p.blocks[0]] = "keep"
+        votes[p.blocks[-1]] = "keep"
+    excerpt, kept = fit(p, votes, budget, "decision prune (native)")
+    cap_factor = float(pc.get("hard_cap_factor", 2.0))
+    excerpt = hard_cap(excerpt, int(budget * cap_factor))
+    fallback = Pruner([], jev_enabled=False, archive_dir=None)
+    excerpt = fallback._finish(excerpt, None, len(kept), p)
+    result = PruneResult(
+        text=excerpt,
+        provider="native",
+        tier="native",
+        original_chars=len(text),
+        result_chars=len(excerpt),
+        original_tokens=estimate_tokens(text),
+        result_tokens=estimate_tokens(excerpt),
+        kept_lines=len(kept),
+        total_lines=len(text.splitlines()),
+        fallback_reason="pruning_error",
+        error=type(error).__name__,
+        native_fallback=True,
+        compression_ratio=round(len(excerpt) / len(text), 4) if text else 1.0,
+        attempts=[
+            {
+                "tier": "native",
+                "provider": "native",
+                "outcome": "accepted",
+                "reason": "pruning_error",
+            }
+        ],
+    )
+    try:
+        ledger = Ledger(cfg.ledger_path(), caller=caller)
+        ledger.write([ledger.prune_receipt(request, result)])
+    except Exception as accounting_error:  # noqa: BLE001 - never break the calling tool
+        logging.getLogger(__name__).debug(
+            "Could not write native prune receipt (%s)", type(accounting_error).__name__
+        )
+    return excerpt, result
 
 
 def cmd_prune(args: argparse.Namespace) -> int:
@@ -654,6 +1160,46 @@ def cmd_prune_test(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 1 if failures else 0
 
 
+PRUNE_CALLERS = ("cline", "codex", "claude", "csmart", "freebuff", "opencode2")
+
+SHIM = """#!/usr/bin/bash
+# decision-router shell shim for {caller} (generated by `decision adapter shim {caller}`).
+# Runs the real bash. When stdout is captured (not a terminal) and bash was asked to
+# run a command string (-c), the command runs under the shared `decision prune`,
+# which keeps the exit status and stderr and only shortens long stdout.
+# Rollback: stop pointing {caller} at this file.
+wants_prune=0
+if [ "${{DECISION_PRUNE_ACTIVE:-}}" != 1 ] && [ ! -t 1 ]; then
+    for arg in "$@"; do
+        case "$arg" in
+            --) break ;;
+            -*c*) case "$arg" in --*) ;; *) wants_prune=1 ;; esac ;;
+            -*) ;;
+            *) break ;;
+        esac
+    done
+fi
+if [ "$wants_prune" = 1 ] && [ -x "{decision}" ]; then
+    exec "{decision}" prune --caller {caller} -- /usr/bin/bash "$@"
+fi
+exec /usr/bin/bash "$@"
+"""
+
+
+def shim_path(caller: str) -> Path:
+    return cfg.data_dir() / "shims" / caller / "bash"
+
+
+def cmd_adapter(args: argparse.Namespace) -> int:
+    decision = shutil.which("decision") or str(Path.home() / ".local/bin/decision")
+    path = Path(args.path).expanduser() if args.path else shim_path(args.caller)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(SHIM.format(caller=args.caller, decision=decision))
+    path.chmod(0o755)
+    print(path)
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="decision", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)  # fmt: skip
@@ -689,6 +1235,16 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--mode", choices=cfg.MODES)
     s.set_defaults(func=cmd_test)
 
+    s = sub.add_parser("benchmark", help="explicitly benchmark local decision and pruning models")
+    s.add_argument("--operation", choices=("decision", "prune", "all"), default="all")
+    s.add_argument(
+        "--limit", type=int, default=0, help="limit each benchmark to the first N fixtures"
+    )
+    s.add_argument(
+        "--include-jev", action="store_true", help="only consider JEV if globally enabled"
+    )
+    s.set_defaults(func=cmd_benchmark)
+
     s = sub.add_parser("ledger", help="show recent receipts")
     s.add_argument("-n", type=int, default=20)
     s.set_defaults(func=cmd_ledger)
@@ -716,6 +1272,13 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--preserve", action="append", help="keep lines containing this text")
     s.add_argument("--json", action="store_true", help="print the PruneResult as JSON")
     s.set_defaults(func=cmd_prune, run=None)
+
+    s = sub.add_parser("adapter", help="thin adapters for other tools")
+    adapter = s.add_subparsers(dest="adapter_command", required=True)
+    shim = adapter.add_parser("shim", help="write the bash shim a tool uses for pruning")
+    shim.add_argument("caller", choices=PRUNE_CALLERS)
+    shim.add_argument("--path", help="where to write it (default: the shared shims directory)")
+    shim.set_defaults(func=cmd_adapter)
 
     s = sub.add_parser("install-rule", help="install the Cline rule")
     s.add_argument("--dest")

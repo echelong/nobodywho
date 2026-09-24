@@ -144,6 +144,10 @@ class Ledger:
             "latency_ms": result.latency_ms,
             "fallback_reason": result.fallback_reason,
             "jev_used": result.jev_used,
+            "jev_reason": result.fallback_reason if result.jev_used else None,
+            "native_fallback": result.native_fallback,
+            "compression_ratio": result.compression_ratio,
+            "error": result.error,
             "attempts": [
                 {
                     k: a.get(k)

@@ -134,6 +134,39 @@ def _search() -> tuple[str, str, str, list[str]]:
             ["src/pkg_0/mod_0.py:1:", "src/pkg_149/mod_1499.py:"])  # fmt: skip
 
 
+def _lint() -> tuple[str, str, str, list[str]]:
+    lines = [f"src/generated/module_{i}.py:1:1: I001 Import block is un-sorted or un-formatted"
+             for i in range(850)]  # fmt: skip
+    lines += [
+        "src/api/routes.py:73:9: F821 Undefined name `current_user`",
+        "src/db/session.py:118:5: B904 Within an `except` clause, raise exceptions with `raise ... from err`",
+        "Found 852 errors.",
+        "ruff check failed with exit code 1",
+    ]
+    return ("lint", "ruff check .", "\n".join(lines),
+            ["src/api/routes.py:73:9: F821", "current_user", "src/db/session.py:118:5: B904",
+             "Found 852 errors.", "exit code 1"])  # fmt: skip
+
+
+def _stdout_stderr() -> tuple[str, str, str, list[str]]:
+    stdout = [f"[worker-{i % 8}] processed batch {i:05d}: {i * 24} records"
+              for i in range(1200)]  # fmt: skip
+    stderr = [f"2026-09-24T11:{i // 60:02d}:{i % 60:02d}Z DEBUG retry loop {i}"
+              for i in range(500)]  # fmt: skip
+    stderr += [
+        "2026-09-24T11:09:01Z ERROR worker failed: ConnectionResetError: peer reset",
+        '  File "src/queue/consumer.py", line 207, in consume_batch',
+        "    raise ConnectionResetError(104, 'Connection reset by peer')",
+        "ConnectionResetError: [Errno 104] Connection reset by peer",
+        "Process exited with status 23",
+    ]
+    output = "STDOUT:\n" + "\n".join(stdout) + "\nSTDERR:\n" + "\n".join(stderr)
+    return ("stdout-stderr", "./scripts/consume --workers 8", output,
+            ["STDOUT:", "STDERR:", "src/queue/consumer.py", "line 207",
+             "ConnectionResetError: [Errno 104] Connection reset by peer",
+             "status 23"])  # fmt: skip
+
+
 CASES = (
     _pytest,
     _typecheck,
@@ -143,6 +176,8 @@ CASES = (
     _git_diff,
     _make_fail,
     _search,
+    _lint,
+    _stdout_stderr,
 )
 
 

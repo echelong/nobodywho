@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 MODES = ("off", "jev", "local", "shadow", "compare", "local-first")
-DEFAULT_MODE = "jev"
+DEFAULT_MODE = "local-first"
 
 DEFAULT_LOCAL_MODEL = "huggingface:NobodyWho/Qwen_Qwen3-0.6B-GGUF/Qwen_Qwen3-0.6B-Q4_K_M.gguf"
 
@@ -29,7 +29,7 @@ DEFAULTS: dict[str, Any] = {
         "key_file": "~/.config/jev/typesafe.key",
         "timeout_s": 20,
         # Hard switch: when false the router never calls JEV, in any mode.
-        "enabled": True,
+        "enabled": False,
     },
     "local": {
         "source": DEFAULT_LOCAL_MODEL,
@@ -48,7 +48,9 @@ DEFAULTS: dict[str, Any] = {
     # local-first: each tier inherits every "local" setting it does not override.
     "tiers": {
         "1": {"label": "tier1"},
-        "2": {"label": "tier2", "idle_timeout_s": 120, "timeout_s": 300},
+        # evict_tiers: GPU workers to stop before this tier cold-starts (8 GB cards cannot
+        # hold a resident tier 1 and a 27B's Vulkan buffers at once).
+        "2": {"label": "tier2", "idle_timeout_s": 120, "timeout_s": 300, "evict_tiers": ["1"]},
     },
     # When a local tier's answer is good enough to stop escalating.
     "acceptance": {
@@ -62,7 +64,7 @@ DEFAULTS: dict[str, Any] = {
         "budget_chars": 12000,
         "block_lines": 30,
         "hard_cap_factor": 2.0,
-        "archive": True,  # keep the full output under $XDG_STATE_HOME/decision-router/prune-archive
+        "archive": False,  # output can contain secrets; the shared ledger stores sizes only
         "tier1": {"max_blocks": 24, "timeout_s": 45},
         "tier2": {"enabled": True, "max_blocks": 8, "timeout_s": 150},
         "jev_max_blocks": 60,
@@ -101,6 +103,13 @@ def runtime_dir() -> Path:
     return Path(runtime) / "decision-router" if runtime else state_dir() / "run"
 
 
+def data_dir() -> Path:
+    override = os.environ.get("DECISION_ROUTER_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
+    return _xdg("XDG_DATA_HOME", ".local/share") / "decision-router"
+
+
 def prune_archive_dir() -> Path:
     return state_dir() / "prune-archive"
 
@@ -134,13 +143,6 @@ def load() -> dict[str, Any]:
         stored = {}
     config = _merge(DEFAULTS, stored)
 
-    # The existing ds launcher exports these for JEV; honour them.
-    if os.environ.get("JEV_BASE_URL", "").strip():
-        config["jev"]["endpoint"] = os.environ["JEV_BASE_URL"].strip()
-    if os.environ.get("JEV_MODEL", "").strip():
-        config["jev"]["model"] = os.environ["JEV_MODEL"].strip()
-    if os.environ.get("JEV_KEY_FILE", "").strip():
-        config["jev"]["key_file"] = os.environ["JEV_KEY_FILE"].strip()
     return config
 
 

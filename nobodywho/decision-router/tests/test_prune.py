@@ -5,12 +5,14 @@ import os
 import subprocess
 import sys
 import time
+from typing import Any
 
 import pytest
 from helpers import FAKE_KEY, FakeTransport
 
 from decision_router import cli
 from decision_router import config as cfg
+from decision_router import prune as prune_module
 from decision_router.ledger import Ledger
 from decision_router.providers.jev import JevProvider
 from decision_router.prune import (
@@ -18,6 +20,7 @@ from decision_router.prune import (
     KEEP,
     Pruner,
     PruneRequest,
+    PruneResult,
     PruneTierError,
     Tier,
     is_repetitive,
@@ -151,7 +154,40 @@ def test_tier1_success_keeps_tier2_and_jev_dormant():
     p = pruner(judge_all(DROP), judge_all(KEEP, t2), judge_all(KEEP, jev))
     result = p.prune(PruneRequest(output=LONG, budget_chars=3000))
     assert result.tier == 1 and result.provider == "nobodywho" and not result.jev_used
+    assert not result.native_fallback and 0 <= result.compression_ratio <= 1
     assert t2 == [] and jev == [] and p.jev_calls == 0
+
+
+def test_quality_failure_rejects_a_local_result_and_escalates(monkeypatch):
+    original_fit = prune_module.fit
+    calls = 0
+
+    def lose_critical_once(plan, votes, budget, label):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "[bad local result]", set()
+        return original_fit(plan, votes, budget, label)
+
+    monkeypatch.setattr(prune_module, "fit", lose_critical_once)
+    result = pruner(judge_all(DROP), judge_all(DROP)).prune(
+        PruneRequest(output=LONG, budget_chars=3000)
+    )
+    assert result.provider == "nobodywho" and result.tier == 2
+    assert result.fallback_reason == "pruning_quality_failure"
+    assert "assert 500 == 200" in result.text and not result.native_fallback
+
+
+def test_native_result_marks_both_local_failures_and_disabled_jev():
+    result = pruner(
+        failing("worker_failure"),
+        failing("invalid_output"),
+        judge_all(DROP),
+        jev_enabled=False,
+    ).prune(PruneRequest(output=LONG, budget_chars=3000))
+    assert result.provider == "native" and result.native_fallback
+    assert result.fallback_reason == "jev_disabled"
+    assert result.compression_ratio == round(result.result_chars / result.original_chars, 4)
 
 
 @pytest.mark.parametrize(
@@ -252,10 +288,42 @@ def test_jev_judge_rejects_malformed_answers(key_file):
 # ---------------------------------------------------------------- request contract
 
 
-@pytest.mark.parametrize("kwargs", [{"budget_chars": 10}, {"preserve": ("",)}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"budget_chars": 10},
+        {"preserve": ("",)},
+        {"caller": "not a caller"},
+        {"id": "contains spaces"},
+        {"metadata": {"too_large": "x" * 2_100}},
+    ],
+)
 def test_prune_request_validation(kwargs):
     with pytest.raises(ValueError):
         PruneRequest(output="x", **kwargs)
+
+
+@pytest.mark.parametrize("kwargs", [{"preserve": "file.py:12"}, {"metadata": "unsafe"}])
+def test_prune_request_rejects_wrong_container_types(kwargs):
+    with pytest.raises(TypeError):
+        PruneRequest(output="x", **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "exception"),
+    [
+        ({"text": None}, TypeError),
+        ({"provider": ""}, ValueError),
+        ({"original_chars": -1}, ValueError),
+        ({"compression_ratio": 1.1}, ValueError),
+        ({"attempts": "invalid"}, TypeError),
+    ],
+)
+def test_prune_result_validation(kwargs: dict[str, Any], exception: type[Exception]):
+    values: dict[str, Any] = {"text": "output", "provider": "native"}
+    values.update(kwargs)
+    with pytest.raises(exception):
+        PruneResult(**values)
 
 
 # ---------------------------------------------------------------- ledger / cli
@@ -275,12 +343,16 @@ def test_prune_receipt_never_holds_output(tmp_path):
     assert record["operation"] == "prune" and record["caller"] == "codex"
     assert record["command_name"] == "pytest" and record["jev_used"] is False
     assert record["original_chars"] > record["result_chars"]
+    assert "native_fallback" in record and "compression_ratio" in record
 
 
 def _cli(*args, stdin: str = "", env: dict | None = None):
+    child_env = dict(os.environ)
+    child_env.pop("DECISION_PRUNE_ACTIVE", None)
+    child_env.update(env or {})
     return subprocess.run(
         [sys.executable, "-m", "decision_router", *args],
-        input=stdin, capture_output=True, text=True, env={**os.environ, **(env or {})},
+        input=stdin, capture_output=True, text=True, env=child_env,
         timeout=60, check=False,
     )  # fmt: skip
 
@@ -326,6 +398,16 @@ def test_cli_prune_json_and_status(capsys):
     assert cli.main(["prune", "status"]) == 0
     shown = capsys.readouterr().out
     assert "tier 3: typesafe" in shown and "DISABLED" in shown and "native truncation" in shown
+
+
+@pytest.mark.parametrize("caller", cli.PRUNE_CALLERS)
+def test_adapter_shim_supports_each_client(caller, tmp_path, capsys):
+    path = tmp_path / caller / "bash"
+    assert cli.main(["adapter", "shim", caller, "--path", str(path)]) == 0
+    capsys.readouterr()
+    shim = path.read_text()
+    assert f'" prune --caller {caller} -- ' in shim
+    assert path.stat().st_mode & 0o111
 
 
 def test_prune_is_fast_without_models():

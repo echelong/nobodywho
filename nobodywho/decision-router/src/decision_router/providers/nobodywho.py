@@ -134,6 +134,7 @@ class PersistentWorker:
         self.socket_path = self.runtime_dir / f"{name}.sock"
         self.pid_path = self.runtime_dir / f"{name}.pid"
         self.lock_path = self.runtime_dir / f"{name}.lock"
+        self.log_path = self.runtime_dir / f"{name}.log"
         self.idle_timeout_s = float(idle_timeout_s)
         self.start_timeout_s = float(start_timeout_s)
 
@@ -181,18 +182,26 @@ class PersistentWorker:
                 return self._connect()  # another caller started it meanwhile
             except OSError:
                 self.stop()  # clear a stale socket or a hung worker
-            subprocess.Popen(
-                [
-                    self.python, str(WORKER), "--serve", str(self.socket_path),
-                    "--idle-timeout", str(self.idle_timeout_s),
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=_worker_env(),
-                start_new_session=True,
-                close_fds=True,
-            )  # fmt: skip
+            worker_log = None
+            try:
+                if os.environ.get("DECISION_ROUTER_CAPTURE_WORKER_LOG") == "1":
+                    fd = os.open(self.log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    worker_log = os.fdopen(fd, "ab", buffering=0)
+                subprocess.Popen(
+                    [
+                        self.python, str(WORKER), "--serve", str(self.socket_path),
+                        "--idle-timeout", str(self.idle_timeout_s),
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=worker_log if worker_log is not None else subprocess.DEVNULL,
+                    env=_worker_env(),
+                    start_new_session=True,
+                    close_fds=True,
+                )  # fmt: skip
+            finally:
+                if worker_log is not None:
+                    worker_log.close()
             limit = min(deadline, time.monotonic() + self.start_timeout_s)
             while time.monotonic() < limit:
                 try:
@@ -255,6 +264,7 @@ class NobodyWhoProvider:
         self.timeout_s = float(timeout_s)
         self._model_info = model_info
         self.runner = runner or subprocess_runner(python or sys.executable)
+        self.evict: list[PersistentWorker] = []
 
     @classmethod
     def from_config(cls, config: dict[str, Any], **kwargs: Any) -> NobodyWhoProvider:
@@ -264,9 +274,21 @@ class NobodyWhoProvider:
     @classmethod
     def for_tier(cls, config: dict[str, Any], tier: str, **kwargs: Any) -> NobodyWhoProvider:
         """The provider for one local-first tier, with its own worker."""
-        return cls.from_settings(
-            cfg.tier_settings(config, tier), worker_name=f"tier{tier}-worker", **kwargs
-        )
+        settings = cfg.tier_settings(config, tier)
+        provider = cls.from_settings(settings, worker_name=f"tier{tier}-worker", **kwargs)
+        for other in settings.get("evict_tiers") or ():
+            other_settings = cfg.tier_settings(config, str(other))
+            if other_settings.get("persistent") and other_settings.get("use_gpu"):
+                provider.evict.append(
+                    PersistentWorker(sys.executable, cfg.runtime_dir(), name=f"tier{other}-worker")
+                )
+        return provider
+
+    def _make_room(self) -> None:
+        """Before this worker cold-starts, stop the GPU workers it cannot share VRAM with."""
+        if self.evict and isinstance(self.runner, PersistentWorker) and self.runner.pid() is None:
+            for worker in self.evict:
+                worker.stop()
 
     @classmethod
     def from_settings(
@@ -334,6 +356,7 @@ class NobodyWhoProvider:
             details["model_sha256"] = info["sha256"]
         model = Path(self.model_path or "").stem or None
 
+        self._make_room()
         job = {
             "model_path": self.model_path,
             "system_prompt": SYSTEM_PROMPT,
@@ -385,6 +408,7 @@ class NobodyWhoProvider:
         ok, why = self.available()
         if not ok:
             return {"error": why, "reason": "local_model_unavailable"}
+        self._make_room()
         job = {
             "model_path": self.model_path,
             "system_prompt": system_prompt,

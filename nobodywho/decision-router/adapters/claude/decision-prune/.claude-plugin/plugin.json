@@ -1,0 +1,17 @@
+{
+  "name": "decision-prune",
+  "version": "0.1.0",
+  "description": "Thin adapter: long Bash output goes through the shared `decision prune` (local-first, extractive). No provider logic or credentials live here.",
+  "author": {
+    "name": "echelong"
+  },
+  "license": "EUPL-1.2",
+  "userConfig": {
+    "minChars": {
+      "type": "number",
+      "title": "Minimum stdout characters",
+      "description": "Bash stdout at or below this size passes through untouched.",
+      "default": 12000
+    }
+  }
+}

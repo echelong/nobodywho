@@ -1,0 +1,13 @@
+{
+  "name": "decision-router",
+  "owner": { "name": "echelong", "url": "https://github.com/echelong" },
+  "plugins": [
+    {
+      "name": "decision-prune",
+      "source": "./decision-prune",
+      "description": "Thin adapter: long Bash output goes through the shared `decision prune` (local-first)",
+      "version": "0.1.0",
+      "license": "EUPL-1.2"
+    }
+  ]
+}
