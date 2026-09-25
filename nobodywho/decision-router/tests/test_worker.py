@@ -74,10 +74,15 @@ def test_denied_worker_socket_does_not_restart_or_remove_worker(worker, monkeypa
 
 def test_worker_env_has_guard_and_no_key(worker, monkeypatch):
     monkeypatch.setenv("TYPESAFE_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("GITHUB_TOKEN", "sentinel-github-token")
+    monkeypatch.setenv("DB_PASSWORD", "sentinel-db-password")
     worker(MISSING_MODEL_JOB, 10)
     environ = Path(f"/proc/{worker.pid()}/environ").read_bytes().split(b"\0")
     assert b"DECISION_ROUTER_ACTIVE=1" in environ
-    assert not any(e.startswith(b"TYPESAFE_API_KEY=") for e in environ)
+    joined = b"\0".join(environ)
+    assert b"TYPESAFE_API_KEY" not in joined and FAKE_KEY.encode() not in joined
+    assert b"GITHUB_TOKEN" not in joined and b"sentinel-github-token" not in joined
+    assert b"DB_PASSWORD" not in joined and b"sentinel-db-password" not in joined
 
 
 def test_dead_worker_is_restarted(worker):

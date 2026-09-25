@@ -20,16 +20,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import platform
 import subprocess
 import sys
 import time
 from pathlib import Path
 
-import torch
-from peft import PeftModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# torch/peft/transformers exist only in the dedicated training virtualenv
+# (specialist/requirements-train.txt), never in the runtime environment; the
+# `ty: ignore` markers below document exactly that boundary and nothing else.
+import torch  # ty: ignore[unresolved-import]
+from peft import PeftModel  # ty: ignore[unresolved-import]
+from transformers import AutoModelForCausalLM, AutoTokenizer  # ty: ignore[unresolved-import]
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import provenance
+
 from decision_router import specialist as spec
 
 
@@ -92,6 +99,10 @@ def build_manifest(
         die("the dataset manifest was not rendered with this system prompt contract")
     if not (dataset_manifest.get("dataset_version") and dataset_manifest.get("splits")):
         die("the dataset manifest is incomplete")
+    # Every split file is hashed here, on disk, against its recorded digest.
+    problems = provenance.check(dataset_manifest, split_dir=dataset_dir)
+    if problems:
+        die("dataset provenance is inconsistent:\n  " + "\n  ".join(problems))
     report = json.loads(train_report.read_text())
     selection = report.get("selection") or {}
     epoch = selection.get("epoch")
@@ -128,7 +139,10 @@ def build_manifest(
         },
         "dataset": {
             "dataset_version": dataset_manifest["dataset_version"],
-            "generator_sha256": dataset_manifest["generator_sha256"],
+            # Which source generated the splits and which source reproduces
+            # them byte-for-byte (see specialist/provenance.py).
+            **provenance.dataset_block(dataset_manifest),
+            "requested_counts": dataset_manifest.get("requested_counts"),
             "splits": {
                 name: {"examples": split["examples"], "digest": split["digest"]}
                 for name, split in dataset_manifest["splits"].items()
@@ -142,6 +156,12 @@ def build_manifest(
             "runtime_seconds": report.get("runtime_seconds"),
             "torch": report.get("torch"),
             "gpu": report.get("gpu"),
+            # Exact versions of this exporting environment, recorded so the
+            # pipeline can be re-created (see specialist/requirements-train.txt).
+            "tools": {
+                **provenance.tool_versions(),
+                "python": platform.python_version(),
+            },
         },
         "runtime_contract": {
             "system_prompt": spec.SPECIALIST_SYSTEM_PROMPT,

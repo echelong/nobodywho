@@ -19,6 +19,7 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ### Changed
 
+- **Decision router:** Tev-specialist provenance and tooling hardening: dataset and artifact manifests record the generator's `generation_source_sha256` separately from the byte-identical `current_reproducer_sha256`, the training/registration/held-out-evaluation/verification helpers live in `specialist/` with pinned tool versions and no absolute paths, the 97.98% held-out figure is documented as constrained option-classification (not general reasoning), and the local model worker runs with an allow-listed environment that drops credential-shaped variables.
 - **Decision router:** Decision and semantic-pruning tiers can use different local models; a valid abstention by every available local decision tier now returns an abstention when JEV is disabled.
 - **Decision router:** Deterministic pruning now returns before waking a model when its extractive result fits the budget. Disabled Codex's command-rewriting hook because its supported rewrite also grants tool permission.
 - **Decision router:** A disabled JEV tier is never constructed, a sandbox-denied worker socket reports a local error instead of restarting the worker, and a prune with no judgeable block is recorded as deterministic instead of as a model tier.

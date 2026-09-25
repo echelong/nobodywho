@@ -261,6 +261,78 @@ def test_worker_env_is_guarded_and_has_no_key(tmp_path, monkeypatch):
     assert runner({"samples": []}, 10) == {"active": "1", "key": False}
 
 
+# Every category the worker environment must never see, with sentinel values so
+# the tests can prove the VALUES are gone, not just the names.
+CREDENTIAL_SHAPED = {
+    "TYPESAFE_API_KEY": "tsk_sentinel_typesafe",
+    "OPENAI_API_KEY": "sentinel-openai-key",
+    "GITHUB_TOKEN": "sentinel-github-token",
+    "SERVICE_TOKEN": "sentinel-service-token",
+    "NPM_SECRET": "sentinel-npm-secret",
+    "DB_PASSWORD": "sentinel-db-password",
+    "DB_PASSWD": "sentinel-db-passwd",
+    "AUTH_COOKIE": "sentinel-auth-cookie",
+    "APP_CREDENTIALS": "sentinel-app-credentials",
+    "AWS_ACCESS_KEY_ID": "sentinel-aws-access-key",
+    "SSH_AUTH_SOCK": "sentinel-ssh-auth-sock",
+    "API_SESSION_KEY": "sentinel-session-key",
+    "NETRC": "sentinel-netrc",
+}
+
+RUNTIME_SHAPED = (
+    "PATH",
+    "HOME",
+    "XDG_RUNTIME_DIR",
+    "XDG_CACHE_HOME",
+    "CUDA_VISIBLE_DEVICES",
+    "GGML_USE_CUDA",
+    "NOBODYWHO_LOG",
+    "DECISION_ROUTER_RUNTIME_DIR",
+)
+
+
+def test_worker_env_is_allow_listed_and_drops_credential_shapes(monkeypatch):
+    for name, value in CREDENTIAL_SHAPED.items():
+        monkeypatch.setenv(name, value)
+    for name in RUNTIME_SHAPED:
+        monkeypatch.setenv(name, f"runtime-{name.lower()}")
+    monkeypatch.setenv("UNRELATED_NON_SECRET", "no-unlisted-variable-passes")
+
+    env = local_mod._worker_env()
+
+    # Layer 1: unlisted variables never pass at all.
+    assert "UNRELATED_NON_SECRET" not in env
+    # Layer 2: no credential-shaped name survives, and no secret value either.
+    for name, value in CREDENTIAL_SHAPED.items():
+        assert name not in env
+        assert value not in env.values()
+    # The runtime variables the worker genuinely needs are preserved.
+    for name in RUNTIME_SHAPED:
+        assert env[name] == f"runtime-{name.lower()}"
+    assert env["DECISION_ROUTER_ACTIVE"] == "1"
+
+
+def test_credential_values_never_reach_the_worker_process(tmp_path, monkeypatch):
+    for name, value in CREDENTIAL_SHAPED.items():
+        monkeypatch.setenv(name, value)
+    runner = _fake_worker(
+        tmp_path, monkeypatch,
+        "import json, os, sys\n"
+        "sys.stdin.read()\n"
+        "markers = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'PASSWD', 'COOKIE',"
+        " 'CREDENTIAL', 'AUTH', 'BEARER', 'NETRC')\n"
+        "names = sorted(n for n in os.environ if any(m in n.upper() for m in markers))\n"
+        "values = sorted(v for v in set(os.environ.values())"
+        " if v.startswith('sentinel') or v.startswith('tsk_'))\n"
+        "print(json.dumps({'names': names, 'values': values,"
+        " 'active': os.environ.get('DECISION_ROUTER_ACTIVE')}))\n",
+    )  # fmt: skip
+    output = runner({"samples": []}, 10)
+    assert output["names"] == []
+    assert output["values"] == []
+    assert output["active"] == "1"
+
+
 def test_worker_crash_is_contained(tmp_path, monkeypatch):
     runner = _fake_worker(
         tmp_path, monkeypatch, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"

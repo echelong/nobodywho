@@ -66,7 +66,9 @@ def test_builders_and_display_follow_split_config(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.JevProvider, "from_config", forbidden)
     router = cli.build_router(config)
     pruner = cli.build_pruner(config)
-    assert router.tiers[1].model_name == "local-jev-tev-specialist-v1"
+    tier1 = router.tiers[1]
+    assert isinstance(tier1, NobodyWhoProvider)
+    assert tier1.model_name == "local-jev-tev-specialist-v1"
     assert [tier.model for tier in pruner.tiers] == [
         "Qwen_Qwen3-4B-Q4_K_M",
         "Qwen3.5-9B-Q4_K_M",

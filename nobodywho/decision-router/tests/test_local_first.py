@@ -136,7 +136,9 @@ def test_jev_disabled_is_a_hard_prohibition(ledger):
     assert jev.calls == 0 and r.jev_calls == 0
     assert "JEV is disabled" in str(out.note)
     assert [r["provider_reason"] for r in receipts(ledger)] == ["local_error", "local_timeout"]
-    assert out.decision_source == SOURCE_FAILED and out.decision.error == "broken"
+    decision = out.decision
+    assert decision is not None
+    assert out.decision_source == SOURCE_FAILED and decision.error == "broken"
 
 
 def test_all_valid_local_abstentions_are_a_final_abstention(ledger):
@@ -146,7 +148,9 @@ def test_all_valid_local_abstentions_are_a_final_abstention(ledger):
     r = router(ledger, t1, t2, jev, jev_enabled=False)
     out = r.route(make_request(), "local-first", caller="codex")
     assert out.follow is None and out.tier is None
-    assert out.decision.ok and out.decision.abstain and out.decision.error is None
+    decision = out.decision
+    assert decision is not None
+    assert decision.ok and decision.abstain and decision.error is None
     assert out.decision_source == SOURCE_ALL_ABSTAINED
     assert [a["status"] for a in out.attempts] == ["abstained", "abstained"]
     assert [r["model"] for r in receipts(ledger)] == ["specialist", "9b"]
@@ -162,7 +166,9 @@ def test_mixed_abstention_and_failure_is_not_clean_abstention(ledger, first_fail
         make_request(), "local-first"
     )
     assert out.decision_source == SOURCE_FAILED
-    assert out.decision.error == "broken" and not out.decision.abstain
+    decision = out.decision
+    assert decision is not None
+    assert decision.error == "broken" and not decision.abstain
 
 
 @pytest.mark.parametrize("mode", ["jev", "shadow", "compare"])

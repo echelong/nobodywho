@@ -21,10 +21,13 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 
-import torch
-import transformers
-from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# torch/transformers/peft exist only in the dedicated training virtualenv
+# (specialist/requirements-train.txt), never in the runtime environment; the
+# `ty: ignore` markers below document exactly that boundary and nothing else.
+import torch  # ty: ignore[unresolved-import]
+import transformers  # ty: ignore[unresolved-import]
+from peft import LoraConfig, get_peft_model  # ty: ignore[unresolved-import]
+from transformers import AutoModelForCausalLM, AutoTokenizer  # ty: ignore[unresolved-import]
 
 SYSTEM_PROMPT_ASSERTION = (
     "the dataset manifest must pin the system prompt its examples were rendered with"

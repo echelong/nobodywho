@@ -1,0 +1,9 @@
+# Exact tool versions recorded for the local-jev-tev-specialist-v1 training,
+# checkpoint-selection and export run (training virtualenv: Python 3.11.16).
+# The runtime virtualenv needs none of these; its model runtime is pinned in
+# pyproject.toml as `local` (nobodywho==3.0.0).
+torch==2.14.0          # recorded build: 2.14.0+cu130 (NVIDIA RTX 2070 SUPER)
+transformers==5.17.0
+peft==0.21.0
+accelerate==1.15.0
+gguf==0.19.0           # needed by specialist/export_gguf.py (GGUF writing)

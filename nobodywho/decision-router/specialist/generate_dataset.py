@@ -37,6 +37,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import provenance  # sibling module: the shared dataset-provenance schema
+
 GENERATOR_VERSION = "tev-decision-dataset/1.0.0"
 DATASET_VERSION = "local-jev-decision-dataset-v1"
 
@@ -675,7 +677,11 @@ def generate(out_dir: Path, seed: int, counts: dict[str, int]) -> dict[str, Any]
     manifest = {
         "dataset_version": DATASET_VERSION,
         "generator_version": GENERATOR_VERSION,
-        "generator_sha256": sha256_text(Path(__file__).read_text()),
+        # Which source generated these files, and which source reproduces them
+        # byte-for-byte. Equal for a fresh run; a historical dataset records the
+        # two separately (see specialist/README.md, "Provenance fields").
+        **provenance.fields(provenance.sha256_file(Path(__file__))),
+        "requested_counts": dict(counts),
         "seed": seed,
         "generation_method": "procedural templates over slot vocabularies; surface variants (template "
         "phrasing, fact order, prose vs object state, risk) vary independently of "

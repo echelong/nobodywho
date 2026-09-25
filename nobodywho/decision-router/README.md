@@ -284,7 +284,11 @@ locally through the `specialist/` pipeline on a permissively licensed
 Qwen3-0.6B base: a deterministic synthetic dataset for the decision function
 (labels by construction), LoRA r=16, epoch selected on the validation split
 only (98.99% validation / 97.98% held-out test exact match, 100% valid
-option-token outputs). It runs on the NobodyWho runtime with thinking disabled
+option-token outputs). That held-out score is constrained synthetic
+option-classification, not general reasoning: much of the synthetic benchmark
+is surface-separable (a trivial lexical baseline reaches 86.4%) and
+`constraint_match` carries most of the real discrimination — see
+`specialist/README.md`. It runs on the NobodyWho runtime with thinking disabled
 and a GBNF option-token grammar, and it is registered as tier 1 with a
 provenance manifest: the worker hashes the file it actually loads and any
 digest mismatch is a `PRIMARY_IDENTITY_MISMATCH`, never a specialist answer.

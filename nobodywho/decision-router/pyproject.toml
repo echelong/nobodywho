@@ -13,6 +13,9 @@ dependencies = []
 
 [project.optional-dependencies]
 local = ["nobodywho>=3.0.0"]
+# Training/export tools for specialist/; exact recorded pins live in
+# specialist/requirements-train.txt.
+train = ["torch", "transformers", "peft", "accelerate", "gguf"]
 dev = ["pytest>=8", "ruff>=0.15", "ty>=0.0.47"]
 
 [project.scripts]
@@ -35,3 +38,10 @@ markers = [
 
 [tool.ruff]
 line-length = 100
+
+[tool.ty.environment]
+# The specialist training/verification tools in `specialist/` are standalone
+# scripts (not an installed package) whose sibling imports resolve at runtime
+# via an explicit sys.path entry. Put that directory on the checker's search
+# path too, so their imports are analyzed instead of suppressed.
+extra-paths = ["specialist"]

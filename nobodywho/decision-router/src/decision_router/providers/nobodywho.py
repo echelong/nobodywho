@@ -101,9 +101,85 @@ def plan_samples(request: DecisionRequest, samples: int, seed: int) -> list[dict
     return plan
 
 
+# The local model worker is a same-user runner: it needs loader/runtime/CUDA
+# variables and nothing else. Its environment is ALLOW-LISTED below, and no
+# allow rule can rescue a credential-shaped name (second layer). Dropped
+# variables are never logged, named or valued.
+_WORKER_ENV_NAMES = frozenset(
+    {
+        "PATH",  # nvidia-smi and other runtime helpers
+        "HOME",  # user caches and runtime dirs
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "TERM",
+        "NO_COLOR",
+        "LD_LIBRARY_PATH",  # CUDA / driver loader paths
+        "LD_PRELOAD",
+        "PYTHONPATH",  # development checkouts of this package
+        "PYTHONHOME",
+        "PYTHONNOUSERSITE",
+        "RUST_LOG",  # nobodywho's native runtime diagnostics
+        "RUST_BACKTRACE",
+        "OMP_NUM_THREADS",  # CPU-fallback threading
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+    }
+)
+_WORKER_ENV_PREFIXES = (
+    "LC_",  # locale
+    "XDG_",  # user runtime/cache/state dirs (worker sockets, model caches)
+    "CUDA_",  # GPU selection (CUDA_VISIBLE_DEVICES, ...)
+    "NVIDIA_",  # driver/runtime knobs
+    "GGML_",  # llama.cpp runtime tuning
+    "LLAMA_",  # llama.cpp runtime tuning
+    "NOBODYWHO_",  # inference-engine knobs
+    "DECISION_ROUTER_",  # this package's own worker configuration
+)
+# Names that can never reach the worker, whatever else matches. Keys only:
+# removed values are dropped silently and never recorded anywhere.
+_SECRET_ENV_MARKERS = (
+    "API_KEY",
+    "APIKEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "COOKIE",
+    "PRIVATE_KEY",
+    "ACCESS_KEY",
+    "SESSION_KEY",
+    "AUTH",
+    "BEARER",
+    "NETRC",
+)
+
+
+def _env_allowed(name: str) -> bool:
+    """Runtime-only names pass; credential-shaped names never do."""
+    upper = name.upper()
+    if any(marker in upper for marker in _SECRET_ENV_MARKERS):
+        return False
+    return name in _WORKER_ENV_NAMES or name.startswith(_WORKER_ENV_PREFIXES)
+
+
 def _worker_env() -> dict[str, str]:
-    env = dict(os.environ, DECISION_ROUTER_ACTIVE="1")
-    env.pop("TYPESAFE_API_KEY", None)  # the local worker never needs it
+    """The minimal, allow-listed environment the local model worker may see.
+
+    Loader/runtime/CUDA/user-session variables are passed through; every
+    credential-shaped variable (API keys, tokens, secrets, passwords, cookies,
+    credentials, private keys, auth material) is dropped by name before the
+    worker process starts, and nothing about what was dropped is logged.
+    """
+    env = {name: value for name, value in os.environ.items() if _env_allowed(name)}
+    env["DECISION_ROUTER_ACTIVE"] = "1"
     return env
 
 
