@@ -14,6 +14,13 @@ Production mode is `local-first`: NobodyWho Tier 1, NobodyWho Tier 2 when Tier 1
 then JEV only when both local tiers fail and the global JEV switch is enabled. The default config
 keeps that switch off.
 
+Decision tiers are configured under `tiers`. Optional `prune_tiers` entries override the matching
+decision tier for semantic pruning; without an override, older configs keep using the same model
+for both operations. A pruning override with a different model gets its own persistent worker and
+socket. Tier 2 evicts both resident primary workers when its `evict_tiers` names tier 1. If all
+available local decision tiers validly abstain while JEV is disabled, the router returns a final
+abstention. Provider failures still return a failure.
+
 This lives in a fork of [NobodyWho](https://github.com/nobodywho-ooo/nobodywho) as an isolated Python
 package. It does not change NobodyWho's inference core or bindings. It only uses the public
 `nobodywho` Python API (`Model`, `Chat`, `SamplerBuilder`).
@@ -147,14 +154,13 @@ warm persistent worker, end to end per call (the desktop and other applications 
 Before this tuning the same 4B took 494 ms p50 per decision and 1.1-1.5 s / 4.3-4.9 s /
 5.2-5.8 s to prune small / medium / large outputs; the 9B took 1044 ms per decision.
 
-Chosen tiers, per operation:
+The table above is a historical general-model benchmark. The current routes are:
 
-- **decision**: tier 1 Qwen3 4B (GPU, resident), tier 2 Qwen3.5 9B (GPU, cold-starts after
-  evicting tier 1, `cpu_fallback: false`), tier 3 JEV only when enabled. The 9B was as accurate
-  as the 4B on the benchmark but twice as slow.
-- **prune**: tier 1 Qwen3 4B, tier 2 Qwen3.5 9B, JEV only when enabled, then native truncation.
-  The 9B judges noise better, but at 1.1-1.5 s it misses the 500 ms target; the 4B never dropped
-  a useful block. The 0.6B and 0.8B models are faster but drop useful blocks.
+- **decision**: tier 1 local Tev-style Qwen3 0.6B specialist, tier 2 Qwen3.5 9B. The specialist
+  is the primary classifier. Tier 2 handles explicit escalation. JEV is hard disabled.
+- **prune**: P0 deterministic, tier 1 Qwen3 4B, tier 2 Qwen3.5 9B, then native truncation.
+  JEV is hard disabled. The specialist is not used for semantic block judgement because it dropped
+  one useful labelled block; the 4B kept all 9/9 useful blocks in the labelled benchmark.
 - The 27B is not in the interactive path: on this card it cannot be partially offloaded with
   NobodyWho 3.0.0, and on CPU a call takes tens of seconds.
 
@@ -264,14 +270,30 @@ budget), no model is woken and the receipt names the deterministic tier with rea
 `no_judgeable_blocks`. If those critical lines exceed the hard cap, the result is
 native truncation and no local tier is charged with a failure.
 
-## Tev1 specialist status
+## Tev-style specialist status
 
 The official `togethercomputer/Tev1-4B-experimental` checkpoint is a Qwen3.5-4B
 fine-tune with a single-letter decision interface. The model card currently says
 the fine-tuned weight license is being finalized before public conversion; no
-official GGUF is published. Accordingly, this installation does not download,
-convert, activate, or distribute those weights. The generic NobodyWho decision
-tiers remain in place pending a clear license and a measured local benchmark.
+official GGUF is published. This installation therefore does not download,
+convert, activate, or distribute those weights.
+
+Instead, the primary classifier is a Tev-STYLE specialist of its own:
+`local-jev-tev-specialist-v1` (family `tev-style-specialist`), fine-tuned
+locally through the `specialist/` pipeline on a permissively licensed
+Qwen3-0.6B base: a deterministic synthetic dataset for the decision function
+(labels by construction), LoRA r=16, epoch selected on the validation split
+only (98.99% validation / 97.98% held-out test exact match, 100% valid
+option-token outputs). It runs on the NobodyWho runtime with thinking disabled
+and a GBNF option-token grammar, and it is registered as tier 1 with a
+provenance manifest: the worker hashes the file it actually loads and any
+digest mismatch is a `PRIMARY_IDENTITY_MISMATCH`, never a specialist answer.
+
+The generic NobodyWho models remain as escalation tiers. `decision doctor`
+prints the discovery/identity status (`available` is true only for a verified
+artifact), and `decision benchmark specialist` measures the cold and warm
+specialist paths, the generic baseline and the escalation path. Pipeline
+details and every provenance guarantee live in `specialist/README.md`.
 
 The one user config is `~/.config/decision-router/config.json`; all client adapters use the same
 router and append metadata-only receipts to `~/.local/state/decision-router/ledger.jsonl`. Original

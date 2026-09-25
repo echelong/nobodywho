@@ -10,7 +10,7 @@ from decision_router import config as cfg
 from decision_router.acceptance import ESCALATION_REASONS, Policy, judge
 from decision_router.contract import ABSTAIN, SAMPLE_STABILITY, DecisionResult
 from decision_router.providers.nobodywho import NobodyWhoProvider, PersistentWorker
-from decision_router.router import Router
+from decision_router.router import SOURCE_ALL_ABSTAINED, SOURCE_FAILED, Router
 
 
 class Tier:
@@ -135,7 +135,34 @@ def test_jev_disabled_is_a_hard_prohibition(ledger):
     assert out.follow is None and out.tier is None
     assert jev.calls == 0 and r.jev_calls == 0
     assert "JEV is disabled" in str(out.note)
-    assert receipts(ledger)[-1]["provider_reason"] == "jev_disabled"
+    assert [r["provider_reason"] for r in receipts(ledger)] == ["local_error", "local_timeout"]
+    assert out.decision_source == SOURCE_FAILED and out.decision.error == "broken"
+
+
+def test_all_valid_local_abstentions_are_a_final_abstention(ledger):
+    t1 = Tier("specialist", voted({ABSTAIN: 3}))
+    t2 = Tier("9b", voted({ABSTAIN: 3}))
+    jev = Jev()
+    r = router(ledger, t1, t2, jev, jev_enabled=False)
+    out = r.route(make_request(), "local-first", caller="codex")
+    assert out.follow is None and out.tier is None
+    assert out.decision.ok and out.decision.abstain and out.decision.error is None
+    assert out.decision_source == SOURCE_ALL_ABSTAINED
+    assert [a["status"] for a in out.attempts] == ["abstained", "abstained"]
+    assert [r["model"] for r in receipts(ledger)] == ["specialist", "9b"]
+    assert jev.calls == r.jev_calls == 0
+
+
+@pytest.mark.parametrize("first_fails", [True, False])
+def test_mixed_abstention_and_failure_is_not_clean_abstention(ledger, first_fails):
+    abstain = voted({ABSTAIN: 3})
+    failure = broken("local_timeout")
+    t1, t2 = (failure, abstain) if first_fails else (abstain, failure)
+    out = router(ledger, Tier("specialist", t1), Tier("9b", t2), jev_enabled=False).route(
+        make_request(), "local-first"
+    )
+    assert out.decision_source == SOURCE_FAILED
+    assert out.decision.error == "broken" and not out.decision.abstain
 
 
 @pytest.mark.parametrize("mode", ["jev", "shadow", "compare"])
@@ -292,8 +319,8 @@ def test_cli_jev_switch_and_local_first_without_models_makes_no_remote_call(caps
     cli.main(["ask", "--caller", "codex", "--json", json.dumps(request)])
     data = json.loads(capsys.readouterr().out)
     assert data["follow"] is None and data["tier"] is None
-    assert [a["tier"] for a in data["attempts"]] == [1, 2, 3]
-    assert data["attempts"][-1]["escalation_reason"] == "jev_disabled"
+    assert [a["tier"] for a in data["attempts"]] == [1, 2]
+    assert data["attempts"][-1]["escalation_reason"] == "model_unavailable"
     cli.main(["stats"])
     stats = json.loads(capsys.readouterr().out)
     assert stats["ask"]["jev_calls"] == 0 and stats["ask"]["by_caller"]["codex"]["decisions"] == 1

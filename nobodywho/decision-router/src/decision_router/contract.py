@@ -22,6 +22,31 @@ ABSTAIN = "ABSTAIN"
 ABSTAIN_DESCRIPTION = "The evidence in the state is not sufficient to choose one option safely."
 RISKS = ("low", "medium", "high")
 
+# Why an attempt or decision selected no option. Closed vocabulary, recorded
+# verbatim and never mapped onto a candidate option. `ABSTAIN` is the deliberate
+# protocol outcome (the reserved token the classifier selected); the rest are
+# the explicit reasons no selection could be made.
+ABSTAIN_MODEL = "ABSTAIN"
+ABSTAIN_SPECIALIST_UNAVAILABLE = "SPECIALIST_UNAVAILABLE"
+ABSTAIN_PRIMARY_IDENTITY_MISMATCH = "PRIMARY_IDENTITY_MISMATCH"
+ABSTAIN_INVALID_OUTPUT = "INVALID_OUTPUT"
+ABSTAIN_GRAMMAR_FAILURE = "GRAMMAR_FAILURE"
+ABSTAIN_AMBIGUOUS_OUTPUT = "AMBIGUOUS_OUTPUT"
+ABSTAIN_LOW_MARGIN = "LOW_MARGIN"
+ABSTAIN_RUNTIME_FAILURE = "RUNTIME_FAILURE"
+ABSTAIN_TIMEOUT = "TIMEOUT"
+ABSTAIN_REASONS = (
+    ABSTAIN_MODEL,
+    ABSTAIN_SPECIALIST_UNAVAILABLE,
+    ABSTAIN_PRIMARY_IDENTITY_MISMATCH,
+    ABSTAIN_INVALID_OUTPUT,
+    ABSTAIN_GRAMMAR_FAILURE,
+    ABSTAIN_AMBIGUOUS_OUTPUT,
+    ABSTAIN_LOW_MARGIN,
+    ABSTAIN_RUNTIME_FAILURE,
+    ABSTAIN_TIMEOUT,
+)
+
 # Confidence kinds. Never relabel one as another.
 CALIBRATED = "calibrated_probability"
 SAMPLE_STABILITY = "sample_stability"
@@ -216,6 +241,7 @@ class DecisionResult:
     provider: str
     choice: str | None = None
     abstain: bool = False
+    abstain_reason: str | None = None
     model: str | None = None
     latency_ms: int = 0
     confidence: float | None = None

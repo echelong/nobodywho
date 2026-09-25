@@ -15,7 +15,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .contract import ABSTAIN, DecisionResult
+from .contract import (
+    ABSTAIN,
+    ABSTAIN_AMBIGUOUS_OUTPUT,
+    ABSTAIN_GRAMMAR_FAILURE,
+    ABSTAIN_INVALID_OUTPUT,
+    ABSTAIN_LOW_MARGIN,
+    ABSTAIN_MODEL,
+    ABSTAIN_PRIMARY_IDENTITY_MISMATCH,
+    ABSTAIN_RUNTIME_FAILURE,
+    ABSTAIN_SPECIALIST_UNAVAILABLE,
+    ABSTAIN_TIMEOUT,
+    DecisionResult,
+)
 
 ESCALATION_REASONS = (
     "provider_error",
@@ -37,12 +49,42 @@ _PROVIDER_REASONS = {
     "local_runtime_unavailable": "model_unavailable",
     "local_gpu_unavailable": "model_unavailable",
     "local_malformed_response": "invalid_output",
+    "local_grammar_failure": "invalid_output",
     "jev_malformed_response": "invalid_output",
     "local_no_majority": "no_valid_choice",
     "local_error": "worker_failure",
     "nobodywho_error": "provider_error",
     "nobodywho_unavailable": "model_unavailable",
+    "specialist_unavailable": "model_unavailable",
+    "primary_identity_mismatch": "model_unavailable",
 }
+
+# Provider-level failure reasons mapped onto the closed abstention vocabulary
+# (contract.ABSTAIN_REASONS). A specialist tier that cannot serve is
+# SPECIALIST_UNAVAILABLE; any other tier whose runtime cannot serve has a
+# runtime failure. Nothing here ever turns into a candidate option.
+_ABSTAIN_BY_FALLBACK_SPECIALIST = {
+    "specialist_unavailable": ABSTAIN_SPECIALIST_UNAVAILABLE,
+    "primary_identity_mismatch": ABSTAIN_PRIMARY_IDENTITY_MISMATCH,
+    "local_malformed_response": ABSTAIN_INVALID_OUTPUT,
+    "local_grammar_failure": ABSTAIN_GRAMMAR_FAILURE,
+    "jev_malformed_response": ABSTAIN_INVALID_OUTPUT,
+    "local_no_majority": ABSTAIN_AMBIGUOUS_OUTPUT,
+    "local_timeout": ABSTAIN_TIMEOUT,
+    "jev_timeout": ABSTAIN_TIMEOUT,
+    "local_error": ABSTAIN_RUNTIME_FAILURE,
+    "local_model_unavailable": ABSTAIN_SPECIALIST_UNAVAILABLE,
+    "local_runtime_unavailable": ABSTAIN_SPECIALIST_UNAVAILABLE,
+    "local_gpu_unavailable": ABSTAIN_SPECIALIST_UNAVAILABLE,
+    "jev_disabled": ABSTAIN_RUNTIME_FAILURE,
+    "jev_failed": ABSTAIN_RUNTIME_FAILURE,
+}
+_ABSTAIN_BY_FALLBACK_GENERIC = dict(
+    _ABSTAIN_BY_FALLBACK_SPECIALIST,
+    local_model_unavailable=ABSTAIN_RUNTIME_FAILURE,
+    local_runtime_unavailable=ABSTAIN_RUNTIME_FAILURE,
+    local_gpu_unavailable=ABSTAIN_RUNTIME_FAILURE,
+)
 
 
 @dataclass(frozen=True)
@@ -91,3 +133,30 @@ def judge(result: DecisionResult, policy: Policy) -> tuple[bool, str | None]:
     if vote_margin(result.votes) < policy.min_margin:
         return False, "stability_below_threshold"
     return True, None
+
+
+def abstain_reason_for(result: DecisionResult, *, specialist: bool) -> str | None:
+    """The explicit abstention reason implied by a result that selected no option.
+
+    None when the result carries a selection or an explicit reason already. The
+    returned value is always one of contract.ABSTAIN_REASONS.
+    """
+    if result.abstain_reason is not None:
+        return result.abstain_reason
+    if result.abstain:
+        return ABSTAIN_MODEL
+    if result.choice is not None:
+        return None
+    table = _ABSTAIN_BY_FALLBACK_SPECIALIST if specialist else _ABSTAIN_BY_FALLBACK_GENERIC
+    if result.fallback_reason in table:
+        return table[result.fallback_reason]
+    return ABSTAIN_RUNTIME_FAILURE if result.error else ABSTAIN_AMBIGUOUS_OUTPUT
+
+
+def rejection_abstain_reason(escalation_reason: str | None) -> str | None:
+    """The abstention reason for a valid result the acceptance policy rejected."""
+    if escalation_reason == "stability_below_threshold":
+        return ABSTAIN_LOW_MARGIN
+    if escalation_reason in ("abstain", "insufficient_evidence"):
+        return ABSTAIN_MODEL
+    return None

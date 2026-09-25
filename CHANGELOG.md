@@ -19,6 +19,7 @@ Format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/
 
 ### Changed
 
+- **Decision router:** Decision and semantic-pruning tiers can use different local models; a valid abstention by every available local decision tier now returns an abstention when JEV is disabled.
 - **Decision router:** Deterministic pruning now returns before waking a model when its extractive result fits the budget. Disabled Codex's command-rewriting hook because its supported rewrite also grants tool permission.
 - **Decision router:** A disabled JEV tier is never constructed, a sandbox-denied worker socket reports a local error instead of restarting the worker, and a prune with no judgeable block is recorded as deterministic instead of as a model tier.
 - **Decision router:** Local decisions stop each sample once its option is determined and stop sampling once the vote is settled, pruning judges all candidate blocks in one generation, the worker checks free VRAM before a GPU load, and `decision benchmark latency` measures end-to-end latency per local model and operation.

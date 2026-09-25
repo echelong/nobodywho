@@ -45,14 +45,17 @@ DEFAULTS: dict[str, Any] = {
         "persistent": True,
         "idle_timeout_s": 900,
     },
-    # local-first: each tier inherits every "local" setting it does not override.
+    # Decision tiers inherit non-model settings from "local".
     "tiers": {
-        # evict_tiers: GPU workers to stop before this tier cold-starts. An 8 GB card holds
-        # one of tier 1 (4B, ~3 GB) and tier 2 (9B, ~5.5 GB), not both, and NobodyWho fills
+        # evict_tiers: GPU workers to stop before this tier cold-starts. Tier 2 (9B)
+        # may need to evict both the decision and pruning tier 1 workers. NobodyWho fills
         # whatever VRAM is left with layers without reserving room for the context.
         "1": {"label": "tier1", "evict_tiers": ["2"]},
         "2": {"label": "tier2", "idle_timeout_s": 120, "timeout_s": 300, "evict_tiers": ["1"]},
     },
+    # Optional semantic-pruning overrides. Without an override, pruning retains
+    # the corresponding decision tier and worker, as in older installations.
+    "prune_tiers": {},
     # When a local tier's answer is good enough to stop escalating.
     "acceptance": {
         "min_stability": 0.66,  # winner's vote share (sample_stability, not a probability)
@@ -160,14 +163,37 @@ def load() -> dict[str, Any]:
     return config
 
 
-def tier_settings(config: dict[str, Any], tier: str) -> dict[str, Any]:
-    """The effective settings of one local-first tier: "local" overlaid with the tier's own.
+def tier_settings(
+    config: dict[str, Any], tier: str, *, operation: str = "decision"
+) -> dict[str, Any]:
+    """The effective local tier settings for a decision or semantic prune.
 
     The model itself is never inherited: a tier without its own model is unavailable
     rather than silently running the `local` mode's model.
     """
     base = {k: v for k, v in config["local"].items() if k not in MODEL_IDENTITY}
-    return _merge(base, config.get("tiers", {}).get(tier, {}))
+    settings = _merge(base, config.get("tiers", {}).get(tier, {}))
+    if operation == "decision":
+        return settings
+    if operation != "prune":
+        raise ValueError(f"unknown operation: {operation}")
+    override = config.get("prune_tiers", {}).get(tier, {})
+    if "model_path" in override and override["model_path"] != settings.get("model_path"):
+        for key in MODEL_IDENTITY:
+            settings.pop(key, None)
+    settings = _merge(settings, override)
+    # A semantic block judge is never the registered decision classifier.
+    settings.pop("classifier", None)
+    return settings
+
+
+def tier_worker_name(config: dict[str, Any], tier: str, *, operation: str = "decision") -> str:
+    """Share a worker on legacy tiers; isolate a prune tier with its own override."""
+    if operation == "prune" and tier in config.get("prune_tiers", {}):
+        return f"prune-tier{tier}-worker"
+    if operation not in ("decision", "prune"):
+        raise ValueError(f"unknown operation: {operation}")
+    return f"tier{tier}-worker"
 
 
 def mode(config: dict[str, Any]) -> tuple[str, str]:

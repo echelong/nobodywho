@@ -25,13 +25,31 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from .acceptance import Policy, judge
+from . import specialist as spec
+from .acceptance import Policy, abstain_reason_for, judge, rejection_abstain_reason
 from .config import MODES
-from .contract import DecisionRequest, DecisionResult
+from .contract import ABSTAIN_MODEL, DecisionRequest, DecisionResult
 from .ledger import Ledger
 from .sanitize import redact, redact_value
+
+# Local JEV decision sources: the REAL route a decision took. This is the shared
+# vocabulary PS.2e records verbatim; it is never inferred from what was asked for.
+SOURCE_PRIMARY_TEV = "PRIMARY_TEV_CLASSIFIER"
+SOURCE_PRIMARY_LOCAL = "PRIMARY_LOCAL_TIER"
+SOURCE_ESCALATED_LOCAL = "ESCALATED_LOCAL_TIER"
+SOURCE_FALLBACK_TYPESAFE = "FALLBACK_TYPESAFE_JEV"
+SOURCE_ABSTAINED = "ABSTAINED_WITHOUT_ACCEPTED_TIER"
+SOURCE_ALL_ABSTAINED = "ALL_AVAILABLE_TIERS_ABSTAINED"
+SOURCE_IDENTITY_MISMATCH = "PRIMARY_IDENTITY_MISMATCH"
+SOURCE_FAILED = "FAILED"
+
+
+def _now_iso() -> str:
+    """UTC timestamp for physical-attempt provenance (started_at/completed_at)."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 class Provider(Protocol):
@@ -112,6 +130,8 @@ class Outcome:
     note: str | None = None
     tier: int | None = None
     attempts: list[dict[str, Any]] = field(default_factory=list)
+    decision_source: str | None = None
+    classifier: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -129,6 +149,8 @@ class Outcome:
         if self.mode == "local-first":
             data["tier"] = self.tier
             data["attempts"] = self.attempts
+            data["decision_source"] = self.decision_source
+            data["classifier"] = self.classifier
         if self.skipped:
             data["skipped"] = self.skipped
         if self.note:
@@ -303,14 +325,35 @@ class Router:
         attempts: list[dict[str, Any]] = []
         receipts: list[dict[str, Any]] = []
         previous: tuple[str, str] | None = None  # (label, escalation reason)
+        checks: list[tuple[int, dict[str, Any]]] = []
 
-        def record(tier: int, result: DecisionResult, accepted: bool, why: str | None) -> None:
+        def record(
+            tier: int, result: DecisionResult, accepted: bool, why: str | None, role: str
+        ) -> None:
+            classifier = result.details.get("classifier")
+            if isinstance(classifier, dict):
+                checks.append((tier, classifier))
             attempt = {
                 "tier": tier,
                 "provider": result.provider,
+                # One trace per PHYSICAL attempt: specialist primary, generic
+                # escalation and TypeSafe fallback attempts are distinguishable.
+                "role": role,
+                "status": (
+                    "skipped"
+                    if result.fallback_reason == "jev_disabled"
+                    else "accepted"
+                    if accepted
+                    else "abstained"
+                    if result.abstain
+                    else "failed"
+                ),
                 "model": result.model,
                 "choice": result.choice,
                 "abstain": result.abstain,
+                "abstain_reason": result.abstain_reason
+                or rejection_abstain_reason(why)
+                or abstain_reason_for(result, specialist=role == "specialist"),
                 "confidence": result.confidence,
                 "confidence_kind": result.confidence_kind,
                 "latency_ms": result.latency_ms,
@@ -318,6 +361,9 @@ class Router:
                 "escalation_reason": why,
                 "fallback_from": previous[0] if previous else None,
                 "fallback_reason": previous[1] if previous else None,
+                "runtime": result.details.get("runtime"),
+                "started_at": result.details.get("started_at"),
+                "completed_at": result.details.get("completed_at"),
             }
             attempts.append(attempt)
             receipts.append(
@@ -331,6 +377,9 @@ class Router:
 
         final: DecisionResult | None = None
         final_tier: int | None = None
+        final_role: str | None = None
+        fail_closed: DecisionResult | None = None
+        local_results: list[DecisionResult] = []
         if not self.tiers:  # never let a misconfiguration turn local-first into JEV-first
             result = DecisionResult.failure("router", "no local tiers configured", "no_local_tiers")
             self.ledger.write([self.ledger.receipt(request, "local-first", "none", result)])
@@ -339,28 +388,132 @@ class Router:
             )
         for tier in sorted(self.tiers):
             provider = self.tiers[tier]
+            role = "specialist" if getattr(provider, "specialist", None) is not None else "generic"
             for attempt in range(1 + self.policy.max_local_retries):
+                started = _now_iso()
                 result = self._call_tier(provider, request, attempt)
                 accepted, why = judge(result, self.policy)
-                record(tier, result, accepted, why)
+                record(tier, result, accepted, why, role)
+                entry = attempts[-1]
+                entry["started_at"] = entry["started_at"] or started
+                entry["completed_at"] = entry["completed_at"] or _now_iso()
+                if result.details.get("fail_closed"):
+                    # A wrong specialist artifact: the request ends here, cleanly,
+                    # with the real provenance and never a substituted answer.
+                    fail_closed = result
+                    break
                 if accepted:
-                    final, final_tier = result, tier
+                    final, final_tier, final_role = result, tier, role
                     break
                 if why not in ("stability_below_threshold", "abstain", "no_valid_choice"):
                     break  # retrying cannot fix a broken or missing model
+            local_results.append(result)
+            if fail_closed is not None:
+                break
             if final is not None:
                 break
             label = result.model or getattr(provider, "model_name", None) or "unknown"
             previous = (f"{result.provider}/{label}", why or "provider_error")
 
+        def classifier_block() -> dict[str, Any]:
+            """The honest primary-classifier status, best evidence first."""
+            order = {spec.VERIFIED: 3, spec.MISMATCH: 2, spec.UNAVAILABLE: 1, spec.UNVERIFIED: 0}
+            best: tuple[int, dict[str, Any]] | None = None
+            for entry in checks:
+                if best is None or order.get(entry[1].get("status"), -1) > order.get(
+                    best[1].get("status"), -1
+                ):
+                    best = entry
+            if best is not None:
+                return spec.status_block(best[1], tier=best[0])
+            for tier in sorted(self.tiers):
+                found = getattr(self.tiers[tier], "identity_check", None)
+                if callable(found):
+                    check = found()
+                    if check is not None:
+                        return spec.status_block(check, tier=tier)
+            return spec.status_block(None)
+
+        def source_of(role: str | None) -> str:
+            """The REAL route: never a generic primary masquerading as the specialist."""
+            if final is None or final_tier is None or role is None:
+                return SOURCE_FAILED
+            if role == "typesafe":
+                return SOURCE_FALLBACK_TYPESAFE
+            if final_tier != 1:
+                return SOURCE_ESCALATED_LOCAL
+            if role != "specialist":
+                return SOURCE_PRIMARY_LOCAL
+            identity = final.details.get("classifier") if isinstance(final.details, dict) else None
+            verified = isinstance(identity, dict) and identity.get("status") == spec.VERIFIED
+            return SOURCE_PRIMARY_TEV if verified else SOURCE_IDENTITY_MISMATCH
+
+        if fail_closed is not None:
+            self.ledger.write(receipts)
+            return Outcome(
+                request.id, "local-first", decision=fail_closed,
+                attempts=attempts, decision_source=SOURCE_IDENTITY_MISMATCH,
+                classifier=classifier_block(),
+                note="primary identity mismatch (fail_closed): no tier was substituted",
+            )  # fmt: skip
+
         if final is None:
+            if not self.jev_enabled:
+                # An explicit, valid abstention from every local tier is a valid
+                # final outcome. Any unavailable, invalid, timed-out or crashed
+                # tier keeps the ordinary failure semantics instead.
+                def valid_abstain(result: DecisionResult) -> bool:
+                    return (
+                        result.ok
+                        and result.abstain
+                        and result.choice is None
+                        and result.fallback_reason is None
+                        and result.abstain_reason in (None, ABSTAIN_MODEL)
+                    )
+
+                all_abstained = len(local_results) == len(self.tiers) and all(
+                    valid_abstain(result) for result in local_results
+                )
+                failure = next(
+                    (result for result in reversed(local_results) if result.error is not None),
+                    None,
+                )
+                final_result = (
+                    local_results[-1]
+                    if all_abstained
+                    else failure
+                    or DecisionResult.failure(
+                        "router",
+                        "no local answer passed the acceptance policy",
+                        "no_acceptable_local_decision",
+                    )
+                )
+                self.ledger.write(receipts)
+                return Outcome(
+                    request.id,
+                    "local-first",
+                    decision=final_result,
+                    attempts=attempts,
+                    decision_source=SOURCE_ALL_ABSTAINED if all_abstained else SOURCE_FAILED,
+                    classifier=classifier_block(),
+                    note=(
+                        "all available local tiers abstained; evidence insufficient"
+                        if all_abstained
+                        else "no acceptable local decision; JEV is disabled"
+                    ),
+                )
+            started = _now_iso()
             result = self._call("jev", request)
             accepted = result.ok
             record(
-                3, result, accepted, None if accepted else (result.fallback_reason or "jev_failed")
-            )
+                3, result, accepted,
+                None if accepted else (result.fallback_reason or "jev_failed"), "typesafe",
+            )  # fmt: skip
+            entry = attempts[-1]
+            entry["started_at"] = entry["started_at"] or started
+            entry["completed_at"] = entry["completed_at"] or _now_iso()
             if accepted:
-                final, final_tier = result, 3
+                final, final_tier, final_role = result, 3, "typesafe"
             else:
                 final = result
 
@@ -380,6 +533,7 @@ class Router:
         return Outcome(
             request.id, "local-first", follow=follow, decision=final,
             tier=final_tier, attempts=attempts, note=note,
+            decision_source=source_of(final_role), classifier=classifier_block(),
         )  # fmt: skip
 
     def _call_tier(

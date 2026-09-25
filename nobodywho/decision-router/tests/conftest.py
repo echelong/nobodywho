@@ -32,7 +32,13 @@ def isolated_env(tmp_path, monkeypatch):
     runtime = Path(tempfile.mkdtemp(prefix="drt-"))
     monkeypatch.setenv("DECISION_ROUTER_RUNTIME_DIR", str(runtime))
     yield
-    for name in ("local-worker", "tier1-worker", "tier2-worker"):
+    for name in (
+        "local-worker",
+        "tier1-worker",
+        "tier2-worker",
+        "prune-tier1-worker",
+        "prune-tier2-worker",
+    ):
         PersistentWorker(sys.executable, runtime, name=name).stop()
     shutil.rmtree(runtime, ignore_errors=True)
 

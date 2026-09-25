@@ -37,6 +37,17 @@ from pathlib import Path
 MAX_JOB_BYTES = 1 << 20
 
 
+def _sha256_file(path: str, chunk_size: int = 1 << 20) -> str:
+    """The digest of the model file this worker actually loads (streamed)."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(chunk_size):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 class _LoadLog(logging.Handler):
     """Keeps what NobodyWho logs while loading a model: its GPU layer plan and warnings."""
 
@@ -118,22 +129,31 @@ def settled(outputs: list[str], planned: int, min_share: float, min_margin: int)
     return winner - runner_up - remaining >= max(1, min_margin) and winner / planned >= min_share
 
 
-def _generate(chat, prompt: str, choices: list[str] | None) -> str:
-    """One completion; with `choices`, stops once the prefix can only become one of them."""
+def _generate(chat, prompt: str, choices: list[str] | None) -> tuple[str, int]:
+    """One completion and its decode-step count.
+
+    With `choices`, stops once the prefix can only become one of them.
+    """
     stream = chat.ask(prompt)
+    steps = 0
     if not choices:
-        return stream.completed().strip()
+        text = ""
+        while (token := stream.next_token()) is not None:
+            text += token
+            steps += 1
+        return text.strip(), steps
     text = ""
     while (token := stream.next_token()) is not None:
         text += token
+        steps += 1
         head = text.strip()
         matches = [choice for choice in choices if choice.startswith(head)] if head else []
         if len(matches) == 1:
             # The grammar admits only the rest of this choice. Not draining the stream
             # saves a decode step; the chat runs the next command after it stops.
             chat.stop_generation()
-            return matches[0]
-    return text.strip()
+            return matches[0], steps
+    return text.strip(), steps
 
 
 def _constrained_sampler(nobodywho, grammar: str, temperature: float, seed: int):
@@ -180,8 +200,10 @@ def run(job: dict, cache: dict | None = None) -> dict:
         if use_gpu and not gpu_fits_soon(model_path):
             free = free_vram_mib()
             if not job.get("cpu_fallback", True):
-                return {"error": f"model does not fit in free VRAM ({free} MiB)",
-                        "reason": "local_gpu_unavailable"}  # fmt: skip
+                return {
+                    "error": f"model does not fit in free VRAM ({free} MiB)",
+                    "reason": "local_gpu_unavailable",
+                }
             use_gpu = False
             notes.append(f"model does not fit in free VRAM ({free} MiB): loaded on CPU")
         cache.update(
@@ -190,6 +212,10 @@ def run(job: dict, cache: dict | None = None) -> dict:
             gpu_layers=_LOAD_LOG.gpu_layers if use_gpu else 0,
             load_warnings=notes + list(_LOAD_LOG.warnings),
         )
+    if job.get("verify_sha256") and cache.get("model_sha256") is None:
+        # Identity is tied to the actual loaded file: hash it here, in the process
+        # that loads it, and report the measured digest with the result.
+        cache["model_sha256"] = _sha256_file(model_path)
     if cache.get("n_ctx") != n_ctx:  # a new context, never a model reload
         cache.update(
             n_ctx=n_ctx,
@@ -208,24 +234,36 @@ def run(job: dict, cache: dict | None = None) -> dict:
     choices = job.get("choices") or None
     stop_when = job.get("stop_when") or None
     planned = len(job["samples"])
-    outputs, sample_ms = [], []
+    outputs, sample_ms, decode_steps, context_tokens = [], [], [], []
     for sample in job["samples"]:
         chat.reset_history()
-        chat.set_sampler_config(
-            _constrained_sampler(
-                nobodywho, job["grammar"], float(job["temperature"]), int(sample["seed"])
+        try:
+            chat.set_sampler_config(
+                _constrained_sampler(
+                    nobodywho, job["grammar"], float(job["temperature"]), int(sample["seed"])
+                )
             )
-        )
+        except Exception as error:  # noqa: BLE001 - reported as data, never raised
+            return {
+                "error": f"option-token grammar rejected: {type(error).__name__}: {error}"[:300],
+                "reason": "local_grammar_failure",
+            }
         t = time.monotonic()
-        outputs.append(_generate(chat, sample["prompt"], choices))
+        text, steps = _generate(chat, sample["prompt"], choices)
+        outputs.append(text)
+        decode_steps.append(steps)
         sample_ms.append(round((time.monotonic() - t) * 1000))
+        try:
+            context_tokens.append(int(chat.stats().context_used))
+        except Exception:  # noqa: BLE001 - token counts are informational
+            context_tokens.append(None)
         if stop_when and settled(
             outputs, planned, float(stop_when.get("min_share", 1.0)),
             int(stop_when.get("min_margin", 1)),
         ):  # fmt: skip
             break
 
-    return {
+    result = {
         "outputs": outputs,
         "sample_ms": sample_ms,
         "planned": planned,
@@ -234,7 +272,12 @@ def run(job: dict, cache: dict | None = None) -> dict:
         "gpu_layers": cache.get("gpu_layers"),
         "load_warnings": cache.get("load_warnings") or [],
         "runtime": _runtime(nobodywho),
+        "decode_steps": decode_steps,
+        "context_tokens": context_tokens,
     }
+    if cache.get("model_sha256"):
+        result["model_sha256"] = cache["model_sha256"]
+    return result
 
 
 def _safe_run(job: object, cache: dict | None = None) -> dict:

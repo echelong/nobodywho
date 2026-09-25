@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config as cfg
+from . import specialist as spec
 from .acceptance import Policy
 from .contract import DecisionRequest, RequestError
 from .ledger import Ledger
@@ -67,7 +68,7 @@ def caller_name(explicit: str | None) -> str:
 
 def build_router(config: dict[str, Any], caller: str = "unknown") -> Router:
     local = NobodyWhoProvider.from_config(config)
-    key = load_key(config["jev"].get("key_file"))
+    key = load_key(config["jev"].get("key_file")) if jev_enabled(config) else None
     literals = (key,) if key else ()
     providers: dict[str, Provider] = {"nobodywho": local}
     if jev_enabled(config):
@@ -102,27 +103,27 @@ def describe_mode(config: dict[str, Any]) -> str:
     lines = [f"mode: {mode}  (from {source})"]
     jev_state = "disabled (hard: never called)" if not jev_enabled(config) else "enabled"
     if mode == "local-first":
-        tier_labels = {}
         lines.append("decision:")
         for tier in cfg.TIER_NAMES:
             t = cfg.tier_settings(config, tier)
-            tier_labels[tier] = f"nobodywho / {_model_label(t)}"
+            label = f"nobodywho / {_model_label(t)}"
             lifecycle = (
                 f"persistent worker, idle exit {t.get('idle_timeout_s'):g}s"
                 if t.get("persistent")
                 else "loaded per decision"
             )
-            lines.append(
-                f"  D{tier}: {tier_labels[tier]} ({lifecycle}, gpu={bool(t.get('use_gpu'))})"
-            )
+            lines.append(f"  D{tier}: {label} ({lifecycle}, gpu={bool(t.get('use_gpu'))})")
         lines += [
             "  D3: typesafe / "
             + config["jev"]["model"]
             + (" (enabled)" if jev_enabled(config) else " (disabled; hard switch)"),
             "pruning:",
             "  P0: deterministic (ANSI, duplicates and repetitive output)",
-            f"  P1: {tier_labels['1']}",
-            f"  P2: {tier_labels['2']}",
+        ]
+        for tier in cfg.TIER_NAMES:
+            t = cfg.tier_settings(config, tier, operation="prune")
+            lines.append(f"  P{tier}: nobodywho / {_model_label(t)}")
+        lines += [
             "  P3: typesafe / "
             + config["jev"]["model"]
             + (" (enabled)" if jev_enabled(config) else " (disabled; hard switch)"),
@@ -468,7 +469,7 @@ def _benchmark_pruning(config: dict[str, Any], limit: int, include_jev: bool) ->
     try:
         for tier_name in reversed(cfg.TIER_NAMES):
             settings = pc.get(f"tier{tier_name}", {})
-            provider = NobodyWhoProvider.for_tier(config, tier_name)
+            provider = NobodyWhoProvider.for_tier(config, tier_name, operation="prune")
             ready, reason = provider.available()
             if not ready or settings.get("enabled", True) is False:
                 by_tier[tier_name] = {
@@ -588,6 +589,12 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
         latency_report = latency.run(config, args)
         print(json.dumps(latency_report, indent=2) if args.json else latency.table(latency_report))
         return 0 if all(not m.get("error") for m in latency_report["models"]) else 1
+    if args.kind == "specialist":
+        from . import specialist_benchmark
+
+        report = specialist_benchmark.run(config, args.limit)
+        print(json.dumps(report, indent=2))
+        return 0
     report: dict[str, Any] = {"operation": args.operation, "limit": args.limit or "all"}
     if args.operation in ("all", "decision"):
         report["decision"] = _benchmark_decisions(config, args.limit, args.include_jev)
@@ -620,18 +627,23 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     healthy = _check("mode valid", mode in cfg.MODES, mode)
 
     print("jev:")
-    jev = JevProvider.from_config(config)
     enabled = jev_enabled(config)
     print(f"  switch: {'enabled (fallback only in local-first)' if enabled else 'DISABLED (hard)'}")
-    ok, why = jev.available()
-    key_file = Path(str(jev.key_file)).expanduser() if jev.key_file else None
-    if key_file and key_file.exists():
-        perms = stat.S_IMODE(key_file.stat().st_mode)
-        _check("key file", perms & 0o077 == 0, f"{key_file} (mode {perms:o}; contents not shown)")
-    jev_ready = _check("available", ok, why)
-    if mode in ("jev", "shadow", "compare") and enabled:
-        healthy &= jev_ready
-    print(f"  endpoint: {jev.endpoint}  model: {jev.model}  timeout: {jev.timeout_s:g}s")
+    if enabled:
+        jev = JevProvider.from_config(config)
+        ok, why = jev.available()
+        key_file = Path(str(jev.key_file)).expanduser() if jev.key_file else None
+        if key_file and key_file.exists():
+            perms = stat.S_IMODE(key_file.stat().st_mode)
+            _check(
+                "key file", perms & 0o077 == 0, f"{key_file} (mode {perms:o}; contents not shown)"
+            )
+        jev_ready = _check("available", ok, why)
+        if mode in ("jev", "shadow", "compare"):
+            healthy &= jev_ready
+        print(f"  endpoint: {jev.endpoint}  model: {jev.model}  timeout: {jev.timeout_s:g}s")
+    else:
+        print("  provider: not constructed")
 
     runtime_ok, runtime = _runtime_version()
     local_names = {"local": ("local", NobodyWhoProvider.from_config(config))}
@@ -656,6 +668,27 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     runtime_ready = _check("runtime", runtime_ok, runtime)
     if mode in ("local", "shadow", "compare", "local-first"):
         healthy &= runtime_ready
+
+    print("specialist:")
+    tier_settings = {tier: cfg.tier_settings(config, tier) for tier in cfg.TIER_NAMES}
+    registered = any(spec.registration_for(tier, tier_settings[tier]) for tier in tier_settings)
+    status = spec.discovery(tier_settings)
+    print(f"  classifier: {status['classifierId']} ({status['classifierFamily']})")
+    print(
+        f"  thinking: {'on' if status['thinkingEnabled'] else 'off'}  "
+        f"option-token grammar: {status['grammarConstrainedOptionTokens']}"
+    )
+    print(f"  option logits: {status['optionLogits']}  logit margin: {status['logitMargin']}")
+    if not registered:
+        print("  [--] not registered: generic local tiers only (available: false)")
+    else:
+        detail = f"identity {status['status']}" + (
+            f": {'; '.join(status['reasons'])}" if status["reasons"] else ""
+        )
+        specialist_ready = _check("available", status["available"], detail)
+        if mode == "local-first":
+            healthy &= specialist_ready
+
     print(f"acceptance: {config.get('acceptance')}")
 
     print("cline:")
@@ -743,6 +776,7 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
     providers: dict[str, int] = {}
     fallbacks: dict[str, int] = {}
     latencies: list[int] = []
+    model_latencies: dict[str, list[int]] = {}
     for r in records:
         c = by_caller.setdefault(str(r.get("caller", "unknown")),
                                  {"calls": 0, "chars_in": 0, "chars_out": 0,
@@ -777,6 +811,9 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(r.get("latency_ms"), int) and r.get("provider") not in ("none",):
             latencies.append(r["latency_ms"])
             c["latencies_ms"].append(r["latency_ms"])
+            if r.get("model") and r.get("provider") == "nobodywho":
+                model_key = f"{r['provider']}/tier{r.get('tier')}/{r['model']}"
+                model_latencies.setdefault(model_key, []).append(r["latency_ms"])
     for c in by_caller.values():
         samples = sorted(c.pop("latencies_ms"))
         c["median_latency_ms"] = samples[len(samples) // 2] if samples else None
@@ -787,6 +824,9 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
         "fallback_reasons": fallbacks,
         "jev_used": sum(1 for r in records if r.get("jev_used")),
         "median_latency_ms": sorted(latencies)[len(latencies) // 2] if latencies else None,
+        "median_latency_ms_by_model": {
+            key: sorted(values)[len(values) // 2] for key, values in sorted(model_latencies.items())
+        },
     }
 
 
@@ -808,6 +848,7 @@ def summarize_asks(records: list[dict[str, Any]]) -> dict[str, Any]:
     final_tier: dict[str, int] = {}
     jev_calls = local_first = 0
     latencies: dict[str, list[int]] = {}
+    model_latencies: dict[str, list[int]] = {}
     for rows in decisions.values():
         caller = str(rows[0].get("caller", "unknown"))
         stats = by_caller.setdefault(
@@ -848,6 +889,9 @@ def summarize_asks(records: list[dict[str, Any]]) -> dict[str, Any]:
                 latencies.setdefault(
                     f"{r['provider']}/{r.get('tier') or r.get('mode')}", []
                 ).append(r["latency_ms"])
+                if r.get("model"):
+                    model_key = f"{r['provider']}/tier{r.get('tier')}/{r['model']}"
+                    model_latencies.setdefault(model_key, []).append(r["latency_ms"])
     return {
         "receipts": len(records),
         "decisions": len(decisions),
@@ -858,6 +902,9 @@ def summarize_asks(records: list[dict[str, Any]]) -> dict[str, Any]:
         "escalation_reasons": count("escalation_reason"),
         "skipped": count("skipped"),
         "median_latency_ms": {k: sorted(v)[len(v) // 2] for k, v in sorted(latencies.items())},
+        "median_latency_ms_by_model": {
+            key: sorted(values)[len(values) // 2] for key, values in sorted(model_latencies.items())
+        },
     }
 
 
@@ -883,7 +930,13 @@ def cmd_jev(args: argparse.Namespace) -> int:
 def _worker_settings(config: dict[str, Any], which: str) -> tuple[dict[str, Any], str]:
     if which == "local":
         return config["local"], "local-worker"
-    return cfg.tier_settings(config, which), f"tier{which}-worker"
+    if which.startswith("prune"):
+        tier = which.removeprefix("prune")
+        return (
+            cfg.tier_settings(config, tier, operation="prune"),
+            cfg.tier_worker_name(config, tier, operation="prune"),
+        )
+    return cfg.tier_settings(config, which), cfg.tier_worker_name(config, which)
 
 
 def _worker(config: dict[str, Any], which: str = "local") -> PersistentWorker:
@@ -903,24 +956,37 @@ def _worker_status(config: dict[str, Any], which: str = "local") -> str:
     return f"persistent, {state}, idle exit after {settings.get('idle_timeout_s', 900):g}s"
 
 
-WORKERS = ("local", *cfg.TIER_NAMES)
+WORKERS = ("local", *cfg.TIER_NAMES, *(f"prune{t}" for t in cfg.TIER_NAMES))
+
+
+def _active_workers(config: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        "local",
+        *cfg.TIER_NAMES,
+        *(f"prune{t}" for t in cfg.TIER_NAMES if t in config.get("prune_tiers", {})),
+    )
+
+
+def _worker_label(which: str) -> str:
+    if which == "local":
+        return "local"
+    if which.startswith("prune"):
+        return f"prune tier {which.removeprefix('prune')}"
+    return f"decision tier {which}"
 
 
 def cmd_local_status(args: argparse.Namespace) -> int:
     config = cfg.load()
-    for which in WORKERS:
-        print(
-            f"{'local' if which == 'local' else 'tier ' + which}: {_worker_status(config, which)}"
-        )
+    for which in _active_workers(config):
+        print(f"{_worker_label(which)}: {_worker_status(config, which)}")
     return 0
 
 
 def cmd_local_stop(args: argparse.Namespace) -> int:
     config = cfg.load()
-    for which in WORKERS if args.tier is None else (args.tier,):
+    for which in _active_workers(config) if args.tier is None else (args.tier,):
         stopped = _worker(config, which).stop()
-        label = "local" if which == "local" else f"tier {which}"
-        print(f"{label} worker {'stopped' if stopped else 'was not running'}")
+        print(f"{_worker_label(which)} worker {'stopped' if stopped else 'was not running'}")
     return 0
 
 
@@ -977,13 +1043,13 @@ def build_pruner(config: dict[str, Any]) -> Pruner:
         settings = pc.get(f"tier{t}", {})
         if settings.get("enabled", True) is False:
             continue
-        provider = NobodyWhoProvider.for_tier(config, t)
+        provider = NobodyWhoProvider.for_tier(config, t, operation="prune")
         tiers.append(
             Tier(int(t), "nobodywho", provider.model_name,
                  local_judge(provider, timeout_s=settings.get("timeout_s")),
                  max_blocks=int(settings.get("max_blocks", 8)))
         )  # fmt: skip
-    key = load_key(config["jev"].get("key_file"))
+    key = load_key(config["jev"].get("key_file")) if jev_enabled(config) else None
     literals = (key,) if key else ()
     if jev_enabled(config):
         jev = JevProvider.from_config(config)
@@ -1014,7 +1080,7 @@ def _prune_text(args: argparse.Namespace, config: dict[str, Any], text: str) -> 
             preserve=tuple(args.preserve or ()),
         )  # fmt: skip
         pruner = build_pruner(config)
-        literals = JevProvider.from_config(config).secret_literals()
+        literals = pruner.secret_literals
         result = pruner.prune(request)
         ledger = Ledger(cfg.ledger_path(), literals, request.caller)
         ledger.write([ledger.prune_receipt(request, result)])
@@ -1185,7 +1251,7 @@ def cmd_prune_status(config: dict[str, Any]) -> int:
     print(f"minimum output: {pc.get('min_output_chars', 16000)} chars")
     for t in cfg.TIER_NAMES:
         settings = pc.get(f"tier{t}", {})
-        provider = NobodyWhoProvider.for_tier(config, t)
+        provider = NobodyWhoProvider.for_tier(config, t, operation="prune")
         ok, why = provider.available()
         state = "disabled" if settings.get("enabled", True) is False else ("ready" if ok else why)
         print(f"tier {t}: nobodywho {provider.model_name or '-'} "
@@ -1296,8 +1362,9 @@ def parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("benchmark", help="explicitly benchmark local decision and pruning models")
     s.add_argument(
-        "kind", nargs="?", choices=("quality", "latency"), default="quality",
-        help="quality: per-tier answers (default); latency: end-to-end timings per model",
+        "kind", nargs="?", choices=("quality", "latency", "specialist"), default="quality",
+        help="quality: per-tier answers (default); latency: end-to-end timings per model; "
+             "specialist: cold/warm Tev-specialist benchmark and the escalation path",
     )  # fmt: skip
     s.add_argument("--operation", choices=("decision", "prune", "all"), default="all")
     s.add_argument(
@@ -1329,7 +1396,7 @@ def parser() -> argparse.ArgumentParser:
     s = sub.add_parser("local", help="local model management")
     local = s.add_subparsers(dest="local_command", required=True)
     pull = local.add_parser("pull", help="download and pin a local model")
-    pull.add_argument("--tier", choices=WORKERS, default="local")
+    pull.add_argument("--tier", choices=("local", *cfg.TIER_NAMES), default="local")
     pull.add_argument("--source")
     pull.add_argument("--expect-sha256", help="refuse to pin the file unless it has this hash")
     pull.set_defaults(func=cmd_local_pull)

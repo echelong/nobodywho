@@ -27,11 +27,22 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Callable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .. import config as cfg
-from ..contract import ABSTAIN, SAMPLE_STABILITY, DecisionRequest, DecisionResult
+from .. import specialist as spec
+from ..acceptance import abstain_reason_for
+from ..contract import (
+    ABSTAIN,
+    ABSTAIN_AMBIGUOUS_OUTPUT,
+    ABSTAIN_INVALID_OUTPUT,
+    ABSTAIN_MODEL,
+    SAMPLE_STABILITY,
+    DecisionRequest,
+    DecisionResult,
+)
 from ..gguf_info import describe
 from ..sanitize import short_error
 
@@ -47,6 +58,11 @@ SYSTEM_PROMPT = (
 
 # (job, timeout_s) -> worker output dict; raises subprocess.TimeoutExpired on timeout.
 Runner = Callable[[dict[str, Any], float], dict[str, Any]]
+
+
+def _now_iso() -> str:
+    """UTC timestamp for physical-attempt provenance (started_at/completed_at)."""
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def grammar_for(allowed: tuple[str, ...]) -> str:
@@ -286,6 +302,7 @@ class NobodyWhoProvider:
         python: str | None = None,
         stop_when: dict[str, Any] | None = None,
         cpu_fallback: bool = True,
+        specialist_registration: spec.Registration | None = None,
     ) -> None:
         if not 1 <= int(samples) <= 15:
             raise ValueError("samples must be between 1 and 15")
@@ -301,6 +318,18 @@ class NobodyWhoProvider:
         self.stop_when = stop_when
         self.cpu_fallback = bool(cpu_fallback)
         self.evict: list[PersistentWorker] = []
+        self.specialist = specialist_registration
+
+    @property
+    def system_prompt(self) -> str:
+        """The specialist's classification instruction on a specialist tier."""
+        return spec.SPECIALIST_SYSTEM_PROMPT if self.specialist is not None else SYSTEM_PROMPT
+
+    def identity_check(self, verify_by: str = "declared_pin") -> spec.IdentityCheck | None:
+        """The specialist identity check for this tier (None on a generic tier)."""
+        if self.specialist is None:
+            return None
+        return spec.verify(self.specialist, verify_by=verify_by)
 
     @classmethod
     def from_config(cls, config: dict[str, Any], **kwargs: Any) -> NobodyWhoProvider:
@@ -309,17 +338,34 @@ class NobodyWhoProvider:
         return cls.from_settings(config["local"], **kwargs)
 
     @classmethod
-    def for_tier(cls, config: dict[str, Any], tier: str, **kwargs: Any) -> NobodyWhoProvider:
-        """The provider for one local-first tier, with its own worker."""
-        settings = cfg.tier_settings(config, tier)
+    def for_tier(
+        cls, config: dict[str, Any], tier: str, *, operation: str = "decision", **kwargs: Any
+    ) -> NobodyWhoProvider:
+        """The provider for one local-first tier and operation."""
+        settings = cfg.tier_settings(config, tier, operation=operation)
         kwargs.setdefault("stop_when", early_stop(config, settings))
-        provider = cls.from_settings(settings, worker_name=f"tier{tier}-worker", **kwargs)
+        kwargs.setdefault(
+            "specialist_registration",
+            spec.registration_for(tier, settings) if operation == "decision" else None,
+        )
+        provider = cls.from_settings(
+            settings, worker_name=cfg.tier_worker_name(config, tier, operation=operation), **kwargs
+        )
+        seen: set[str] = set()
         for other in settings.get("evict_tiers") or ():
-            other_settings = cfg.tier_settings(config, str(other))
-            if other_settings.get("persistent") and other_settings.get("use_gpu"):
-                provider.evict.append(
-                    PersistentWorker(sys.executable, cfg.runtime_dir(), name=f"tier{other}-worker")
-                )
+            for other_operation in ("decision", "prune"):
+                other_tier = str(other)
+                other_settings = cfg.tier_settings(config, other_tier, operation=other_operation)
+                name = cfg.tier_worker_name(config, other_tier, operation=other_operation)
+                if (
+                    name not in seen
+                    and other_settings.get("persistent")
+                    and other_settings.get("use_gpu")
+                ):
+                    provider.evict.append(
+                        PersistentWorker(sys.executable, cfg.runtime_dir(), name=name)
+                    )
+                    seen.add(name)
         return provider
 
     def _make_room(self) -> None:
@@ -373,14 +419,29 @@ class NobodyWhoProvider:
     def decide(self, request: DecisionRequest, attempt: int = 0) -> DecisionResult:
         """`attempt` > 0 draws a fresh, still deterministic, set of seeds."""
         started = time.monotonic()
+        started_at = _now_iso()
         seed = self.seed + attempt * self.samples
+        registration = self.specialist
+        is_specialist = registration is not None
 
         def elapsed() -> int:
             return round((time.monotonic() - started) * 1000)
 
+        def stamp(result: DecisionResult) -> DecisionResult:
+            result.details.setdefault("completed_at", _now_iso())
+            result.abstain_reason = abstain_reason_for(result, specialist=is_specialist)
+            return result
+
         ok, why = self.available()
         if not ok:
-            return DecisionResult.failure(NAME, why, "local_model_unavailable")
+            reason = "specialist_unavailable" if is_specialist else "local_model_unavailable"
+            result = DecisionResult.failure(NAME, why, reason)
+            if registration is not None:
+                result.details = {
+                    "started_at": started_at,
+                    "classifier": spec.status_block(self.identity_check()),
+                }
+            return stamp(result)
 
         info = self.model_info()
         details: dict[str, Any] = {
@@ -390,15 +451,24 @@ class NobodyWhoProvider:
             "temperature": self.temperature,
             "seeds": [seed + i for i in range(self.samples)],
             "worker": "persistent" if isinstance(self.runner, PersistentWorker) else "oneshot",
+            "started_at": started_at,
         }
         if info.get("sha256"):
             details["model_sha256"] = info["sha256"]
         model = Path(self.model_path or "").stem or None
 
+        if registration is not None:
+            # Structural identity is settled BEFORE the model runs: a wrong or
+            # missing artifact never produces a specialist answer.
+            check = spec.verify(registration)
+            details["classifier"] = check.to_dict()
+            if check.status != spec.UNVERIFIED:
+                return stamp(self._identity_failure(registration, check, elapsed(), model, details))
+
         self._make_room()
         job = {
             "model_path": self.model_path,
-            "system_prompt": SYSTEM_PROMPT,
+            "system_prompt": self.system_prompt,
             "grammar": grammar_for(request.allowed()),
             "choices": list(request.allowed()),
             "samples": plan_samples(request, self.samples, seed),
@@ -407,34 +477,78 @@ class NobodyWhoProvider:
             "use_gpu": self.use_gpu,
             "cpu_fallback": self.cpu_fallback,
         }
+        if is_specialist:
+            # The worker hashes the file it actually loads: identity is proven
+            # against that measured digest, never against a claim.
+            job["verify_sha256"] = True
         if self.stop_when:
             job["stop_when"] = self.stop_when
         try:
             output = self.runner(job, self.timeout_s)
         except subprocess.TimeoutExpired:
-            return DecisionResult.failure(
-                NAME, "timeout", "local_timeout", latency_ms=elapsed(),
-                model=model, details=details,
-            )  # fmt: skip
+            result = DecisionResult.failure(
+                NAME, "timeout", "local_timeout", latency_ms=elapsed(), model=model, details=details
+            )
+            return stamp(result)
         except Exception as error:  # noqa: BLE001 - reported as data
-            return DecisionResult.failure(
-                NAME, short_error(error), "local_error", latency_ms=elapsed(),
-                model=model, details=details,
+            result = DecisionResult.failure(
+                NAME, short_error(error), "local_error",
+                latency_ms=elapsed(), model=model, details=details,
             )  # fmt: skip
+            return stamp(result)
 
         latency = elapsed()
         if not isinstance(output, dict):
             output = {"error": "no output", "reason": "local_error"}
         if output.get("error"):
-            return DecisionResult.failure(
+            result = DecisionResult.failure(
                 NAME, short_error(output["error"]), output.get("reason", "local_error"),
                 latency_ms=latency, model=model, details=details,
             )  # fmt: skip
-        for key in ("runtime", "load_ms", "sample_ms", "model_reused", "gpu_layers"):
+            return stamp(result)
+        for key in (
+            "runtime", "load_ms", "sample_ms", "model_reused", "gpu_layers",
+            "decode_steps", "context_tokens",
+        ):  # fmt: skip
             if key in output:
                 details[key] = output[key]
+
+        if registration is not None:
+            # Identity is now proven against the digest of the file the worker
+            # actually loaded. Anything but VERIFIED is not the specialist's answer.
+            observed = output.get("model_sha256")
+            check = spec.verify(
+                registration,
+                observed_sha256=observed if isinstance(observed, str) else None,
+            )
+            details["classifier"] = check.to_dict()
+            if check.status != spec.VERIFIED:
+                return stamp(self._identity_failure(registration, check, latency, model, details))
+
         planned = output.get("planned") if isinstance(output.get("planned"), int) else None
-        return aggregate(request, output.get("outputs"), latency, model, details, planned)
+        return stamp(aggregate(request, output.get("outputs"), latency, model, details, planned))
+
+    def _identity_failure(
+        self,
+        registration: spec.Registration,
+        check: spec.IdentityCheck,
+        latency: int,
+        model: str | None,
+        details: dict[str, Any],
+    ) -> DecisionResult:
+        """A wrong or absent artifact: never a specialist answer, with real provenance."""
+        reason = (
+            "primary_identity_mismatch"
+            if check.status == spec.MISMATCH
+            else "specialist_unavailable"
+        )
+        details["fail_closed"] = (
+            check.status == spec.MISMATCH and registration.on_identity_mismatch == "fail_closed"
+        )
+        return DecisionResult.failure(
+            NAME, "; ".join(check.reasons) or check.status, reason,
+            latency_ms=latency, model=model, details=details,
+        )  # fmt: skip
 
     def run_prompts(
         self,
@@ -496,9 +610,11 @@ def aggregate(
     """
 
     def fail(error: str, reason: str) -> DecisionResult:
-        return DecisionResult.failure(
+        result = DecisionResult.failure(
             NAME, error, reason, latency_ms=latency_ms, model=model, details=details
         )
+        result.abstain_reason = ABSTAIN_INVALID_OUTPUT
+        return result
 
     if not isinstance(outputs, list) or not outputs:
         return fail("local worker returned no samples", "local_malformed_response")
@@ -514,10 +630,19 @@ def aggregate(
     winner, count = ranked[0]
     tie = len(ranked) > 1 and ranked[1][1] == count
     abstain = not tie and winner == ABSTAIN
+    # NobodyWho exposes no per-option token logits: the vote share is a stability
+    # proxy, never a probability, and the logit fields stay null with a reason.
+    details = dict(
+        details,
+        optionLogits=None,
+        logitMargin=None,
+        logitEvidence=spec.LOGIT_EVIDENCE_UNAVAILABLE,
+    )
     return DecisionResult(
         provider=NAME,
         choice=None if tie or abstain else winner,
         abstain=abstain,
+        abstain_reason=(ABSTAIN_AMBIGUOUS_OUTPUT if tie else ABSTAIN_MODEL if abstain else None),
         model=model,
         latency_ms=latency_ms,
         confidence=count / denominator,
