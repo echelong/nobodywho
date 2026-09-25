@@ -547,10 +547,31 @@ class Pruner:
             t0 = time.monotonic()
             label = f"decision prune ({tier.provider})"
             judged = candidates(p, request.budget_chars, tier.max_blocks, label)
+            if not judged:
+                # No block verdict can change the result, so no model is woken and the
+                # receipt names the deterministic extract rather than this tier.
+                text, keep = fit(p, {}, request.budget_chars, "decision prune (deterministic)")
+                text = self._finish(hard_cap(text, self._cap(request)), archive, len(keep), p)
+                if self._missing_required_facts(p, text):
+                    # Critical lines alone exceed the hard cap; no tier's verdict could help.
+                    attempts.append({"tier": 0, "provider": "deterministic", "outcome": "failed",
+                                     "reason": "pruning_quality_failure",
+                                     "latency_ms": _ms(t0)})  # fmt: skip
+                    previous_reason = "pruning_quality_failure"
+                    break
+                attempts.append({"tier": 0, "provider": "deterministic", "outcome": "accepted",
+                                 "reason": "no_judgeable_blocks", "latency_ms": _ms(t0)})  # fmt: skip
+                return self._done(
+                    result(
+                        text=text, provider="deterministic", tier=0, kept_lines=len(keep),
+                        fallback_reason=previous_reason, attempts=attempts,
+                    ),
+                    started, len(keep),
+                )  # fmt: skip
             try:
                 if tier is self.jev:
                     self.jev_calls += 1
-                votes = tier.judge(request, p, judged) if judged else {}
+                votes = tier.judge(request, p, judged)
                 if set(votes.values()) - {KEEP, DROP} or set(votes) - set(judged):
                     raise PruneTierError("invalid_output", "votes outside keep/drop")
             except PruneTierError as error:

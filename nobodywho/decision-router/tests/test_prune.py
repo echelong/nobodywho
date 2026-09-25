@@ -88,6 +88,35 @@ def test_deterministic_duplicate_fast_path_does_not_wake_model():
     assert calls == []
 
 
+def test_no_judgeable_block_is_deterministic_and_wakes_no_model():
+    calls: list = []
+    jev: list = []
+    # Critical lines alone fill the budget, so no block verdict could change the result.
+    output = "".join(
+        f"error: case {i} failed at src/mod_{i}.py:{i}\n" + f"detail {i} {'x' * 60}\n" * 40
+        for i in range(20)
+    )
+    p = pruner(judge_all(KEEP, calls), judge_all(KEEP, calls), judge_all(KEEP, jev))
+    result = p.prune(PruneRequest(output=output, budget_chars=2000))
+    assert result.provider == "deterministic" and result.tier == 0 and result.model is None
+    assert result.attempts[-1]["reason"] == "no_judgeable_blocks"
+    assert calls == [] and jev == [] and p.jev_calls == 0 and not result.jev_used
+    assert "error: case 0 failed at src/mod_0.py:0" in result.text
+
+
+def test_critical_lines_over_hard_cap_go_native_without_a_model_attempt():
+    calls: list = []
+    output = "".join(
+        f"error: case {i} failed at src/mod_{i}.py:{i}\n" + f"detail {i} {'x' * 60}\n" * 40
+        for i in range(200)
+    )
+    p = pruner(judge_all(KEEP, calls), judge_all(KEEP, calls))
+    result = p.prune(PruneRequest(output=output, budget_chars=2000))
+    assert result.native_fallback and result.fallback_reason == "pruning_quality_failure"
+    assert [a["provider"] for a in result.attempts] == ["deterministic", "native"]
+    assert calls == [] and not result.jev_used
+
+
 @pytest.mark.parametrize("name, command, output, must_keep", CASES, ids=[c[0] for c in CASES])
 def test_critical_facts_survive_even_if_every_block_is_dropped(name, command, output, must_keep):
     result = pruner(judge_all(DROP)).prune(

@@ -65,6 +65,7 @@ ln -s ~/.local/share/decision-router/venv/bin/decision ~/.local/bin/decision
 
 decision local pull      # downloads + pins the default local model (sha256 recorded)
 decision install-rule    # installs the Cline rule into ~/.cline/rules/
+python3 nobodywho/decision-router/adapters/shared/install_policy.py
 decision doctor          # checks configuration and local model availability without live calls
 ```
 
@@ -227,6 +228,12 @@ passes through exactly, without a model call or receipt. `decision run` preserve
 the command's exit status and leaves stderr on its native stream. A nested call
 marked `DECISION_PRUNE_ACTIVE=1` also passes through unchanged.
 
+The shared policy installer renders one short rule for Cline, Codex, Claude,
+csmart, Freebuff and OpenCode2. It uses each client's persistent instruction
+location and retains a `.before-decision-policy` copy if it replaces a different
+file. The rule asks for `decision ask` only at meaningful bounded choices; the
+router owns tier escalation. It does not change any client's model route.
+
 Adapters differ in how reliably they reach the pruner:
 
 - **Cline** uses `adapters/cline/decision-prune.ts` as an `afterTool` plugin on
@@ -238,12 +245,24 @@ Adapters differ in how reliably they reach the pruner:
 - **Claude, csmart (Opus)** use the `decision-prune` Claude plugin after every Bash call. Claude
   Code cuts a *failed* command's output to about 10k characters (head and tail) before a hook sees
   it, so the plugin prunes long successful output; long failing output stays Claude Code's cut.
-- **Codex 0.156.1** uses native tool output handling by default. Its supported
-  `PreToolUse` rewrite requires `permissionDecision: "allow"`, which would change
-  command approval semantics. The old automatic plugin is disabled and its hook
-  returns `{}`. Use `decision prune --caller codex -- bash -c '...'` explicitly for
-  long build or test commands after normal Codex approval. The shared runner still
-  preserves the command's exit status and stderr.
+- **Codex 0.156.1** keeps native command output handling. Its `PreToolUse` command
+  rewrite requires `permissionDecision: "allow"`, which could bypass an approval that
+  would otherwise be required, and its `PostToolUse` hook can add context but cannot
+  replace a command's result. The automatic rewrite therefore stays disabled and the
+  old hook returns `{}`. The data-only `adapters/codex/decision_mcp.py` server exposes
+  `decision_ask` and `decision_prune_text` through Codex's supported MCP tool
+  interface, outside its command sandbox (where the worker socket is unreachable).
+  Install it with `codex mcp add decision-router -- /path/to/python
+  /path/to/decision_mcp.py` and approve only these two tools with
+  `[mcp_servers.decision-router.tools.<name>] approval_mode = "approve"`; shell
+  command approvals remain independent. Explicit `decision prune --caller codex --
+  bash -c '...'` remains available for long output after normal approval, and keeps
+  the exit status and stderr.
+
+When no block verdict could change a result (the critical lines already fill the
+budget), no model is woken and the receipt names the deterministic tier with reason
+`no_judgeable_blocks`. If those critical lines exceed the hard cap, the result is
+native truncation and no local tier is charged with a failure.
 
 ## Tev1 specialist status
 

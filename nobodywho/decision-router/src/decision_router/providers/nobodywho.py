@@ -15,6 +15,7 @@ so an early stop never reports more stability than a full run could.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import json
 import os
@@ -244,7 +245,12 @@ class PersistentWorker:
             try:
                 try:
                     conn = self._connect()
-                except OSError:
+                except OSError as exc:
+                    if exc.errno in (errno.EACCES, errno.EPERM):
+                        return {
+                            "error": f"worker socket access denied: {exc}",
+                            "reason": "local_error",
+                        }
                     conn = self._start(deadline)
                 with conn:
                     conn.settimeout(max(0.01, deadline - time.monotonic()))

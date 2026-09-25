@@ -45,6 +45,9 @@ def test_local_first_provider_shows_both_operation_chains(capsys):
     run(capsys, "provider", "local-first")
     shown = run(capsys, "provider")[1].out
     assert "decision:" in shown and "pruning:" in shown
+    assert all(f"  D{tier}:" in shown for tier in (1, 2, 3))
+    assert all(f"  P{tier}:" in shown for tier in (0, 1, 2, 3))
+    assert "D3: typesafe / jev-latest (disabled" in shown
     assert "final fallback: native truncation" in shown
     assert "tier 3 dormant unless enabled after both local tiers fail" in shown
 

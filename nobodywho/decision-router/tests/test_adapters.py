@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +17,9 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "adapters/codex/pre_tool_use.sh"
 CLINE = ROOT / "adapters/cline/decision-prune.ts"
 SHELL_RUNNER = ROOT / "adapters/shared/decision-run-shell.bash"
+POLICY_INSTALLER = ROOT / "adapters/shared/install_policy.py"
+CLAUDE_HOOK = ROOT / "adapters/claude/decision-prune/hooks/decision-prune.ts"
+CODEX_MCP = ROOT / "adapters/codex/decision_mcp.py"
 
 
 def _codex_hook(payload: dict) -> dict:
@@ -26,6 +31,84 @@ def _codex_hook(payload: dict) -> dict:
         check=True,
     )
     return json.loads(result.stdout)
+
+
+def test_shared_policy_installs_for_six_peers(tmp_path):
+    install = runpy.run_path(str(POLICY_INSTALLER))["install"]
+    paths = install(tmp_path)
+    assert len(paths) == 6
+    for path in paths:
+        text = path.read_text()
+        assert "decision ask --caller" in text
+        assert '"state":"brief facts"' in text
+        assert "bypass decision router" in text
+        assert "Do not run a second pruner" in text
+        assert len(text) < 1_200
+    assert "csmart" in (tmp_path / ".claude-max/CLAUDE.md").read_text()
+    assert "opencode2" in (tmp_path / ".config/opencode/AGENTS.md").read_text()
+    assert "decision_ask" in (tmp_path / ".codex/AGENTS.md").read_text()
+    assert install(tmp_path) == paths
+
+
+def test_codex_mcp_has_data_only_tools(monkeypatch):
+    namespace = runpy.run_path(str(CODEX_MCP))
+    handle = namespace["handle"]
+    tools = handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+    assert {tool["name"] for tool in tools["result"]["tools"]} == {
+        "decision_ask",
+        "decision_prune_text",
+    }
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, '{"follow":"inspect_logs"}', "")
+
+    monkeypatch.setattr(namespace["call_tool"].__globals__["subprocess"], "run", fake_run)
+    result = namespace["call_tool"](
+        "decision_ask",
+        {"state": "error", "question": "Next?", "choices": {"inspect_logs": "Read logs"}},
+    )
+    assert result["follow"] == "inspect_logs"
+    assert calls[0][0][:4] == ["decision", "ask", "--caller", "codex"]
+    namespace["call_tool"]("decision_prune_text", {"output": "long output"})
+    assert calls[1][0] == ["decision", "prune", "--caller", "codex", "--json"]
+    assert calls[1][1]["input"] == "long output"
+
+
+def test_disabled_jev_provider_is_not_constructed(monkeypatch):
+    from decision_router import cli
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("disabled TypeSafe provider was constructed")
+
+    monkeypatch.setattr(cli.JevProvider, "from_config", forbidden)
+    config = cfg.load()
+    assert config["jev"]["enabled"] is False
+    router = cli.build_router(config)
+    pruner = cli.build_pruner(config)
+    assert "jev" not in router.providers
+    assert pruner.jev_enabled is False
+
+
+def test_claude_hook_never_prunes_an_already_pruned_result():
+    if shutil.which("bun") is None:
+        pytest.skip("Bun is unavailable")
+    script = f"""
+import {{ register }} from {json.dumps(CLAUDE_HOOK.as_uri())};
+let hook;
+register((...args) => {{ hook = args[2]; }}, {{ minChars: 1000 }});
+let calls = 0;
+const answer = {{ result: {{ stdout: 'x'.repeat(1200) + '[decision prune: kept 2 of 200 lines]',
+  stderr: '', exitCode: 0 }} }};
+const context = {{ env: {{ get: async () => '/tmp' }},
+  process: {{ run: async () => {{ calls++; return {{ exitCode: 0, stdout: '{{}}' }}; }} }},
+  fs: {{ read: async () => '' }}, ui: {{ toast: () => {{}} }} }};
+const result = await hook(context, {{ command: 'echo test' }}, async () => answer);
+console.log(JSON.stringify({{ calls, same: result === answer }}));
+"""
+    run = subprocess.run(["bun", "-e", script], capture_output=True, text=True, check=True)
+    assert json.loads(run.stdout) == {"calls": 0, "same": True}
 
 
 @pytest.mark.parametrize(

@@ -286,7 +286,8 @@ def test_cli_jev_switch_and_local_first_without_models_makes_no_remote_call(caps
     assert "disabled" in capsys.readouterr().out
     cli.main(["provider", "local-first"])
     shown = capsys.readouterr().out
-    assert "mode: local-first" in shown and "tier 3:" in shown and "disabled" in shown
+    assert "mode: local-first" in shown and "D3:" in shown and "P3:" in shown
+    assert "disabled" in shown
     request = {"question": "Which?", "choices": ["x_a", "x_b"], "state": "evidence"}
     cli.main(["ask", "--caller", "codex", "--json", json.dumps(request)])
     data = json.loads(capsys.readouterr().out)

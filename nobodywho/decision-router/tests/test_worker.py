@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import signal
 import socket
@@ -55,6 +56,20 @@ def test_worker_is_private_to_the_user(worker):
     assert stat.S_IMODE(worker.runtime_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(worker.socket_path.stat().st_mode) & 0o077 == 0
     assert stat.S_ISSOCK(worker.socket_path.stat().st_mode)
+
+
+def test_denied_worker_socket_does_not_restart_or_remove_worker(worker, monkeypatch):
+    def denied():
+        raise PermissionError(errno.EPERM, "sandbox blocked Unix socket")
+
+    def forbidden(_deadline):
+        raise AssertionError("must not stop an existing worker on access denial")
+
+    monkeypatch.setattr(worker, "_connect", denied)
+    monkeypatch.setattr(worker, "_start", forbidden)
+    result = worker(MISSING_MODEL_JOB, 1)
+    assert result["reason"] == "local_error"
+    assert "access denied" in result["error"]
 
 
 def test_worker_env_has_guard_and_no_key(worker, monkeypatch):

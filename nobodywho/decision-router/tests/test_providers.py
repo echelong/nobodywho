@@ -262,7 +262,9 @@ def test_worker_env_is_guarded_and_has_no_key(tmp_path, monkeypatch):
 
 
 def test_worker_crash_is_contained(tmp_path, monkeypatch):
-    runner = _fake_worker(tmp_path, monkeypatch, "import os\nos.abort()\n")
+    runner = _fake_worker(
+        tmp_path, monkeypatch, "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
+    )
     output = runner({"samples": []}, 10)
     assert output["reason"] == "local_error"
 

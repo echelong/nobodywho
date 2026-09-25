@@ -35,6 +35,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (answer.deny !== undefined) return answer;
 
       const prune = async (output: string): Promise<PruneJson | undefined> => {
+        if (output.includes('[decision prune:')) return undefined;
         const home = (await $.env.get('HOME')) ?? '';
         const profile = (await $.env.get('CLAUDE_CONFIG_DIR')) ?? '';
         const caller = profile.endsWith('.claude-max') ? 'csmart' : 'claude';

@@ -37,6 +37,7 @@ from .acceptance import Policy
 from .contract import DecisionRequest, RequestError
 from .ledger import Ledger
 from .providers import JevProvider, NobodyWhoProvider
+from .providers.jev import load_key
 from .providers.nobodywho import PersistentWorker
 from .prune import (
     MAX_OUTPUT_CHARS,
@@ -51,7 +52,7 @@ from .prune import (
     plan,
 )
 from .prune_providers import jev_judge, local_judge
-from .router import Router
+from .router import Provider, Router
 
 RULE_NAME = "decision-router.md"
 STREAM_AFTER_BYTES = 8 << 20
@@ -65,11 +66,14 @@ def caller_name(explicit: str | None) -> str:
 
 
 def build_router(config: dict[str, Any], caller: str = "unknown") -> Router:
-    jev = JevProvider.from_config(config)
     local = NobodyWhoProvider.from_config(config)
-    literals = jev.secret_literals()
+    key = load_key(config["jev"].get("key_file"))
+    literals = (key,) if key else ()
+    providers: dict[str, Provider] = {"nobodywho": local}
+    if jev_enabled(config):
+        providers["jev"] = JevProvider.from_config(config)
     return Router(
-        {"jev": jev, "nobodywho": local},
+        providers,
         Ledger(cfg.ledger_path(), literals, caller),
         literals,
         tiers={int(t): NobodyWhoProvider.for_tier(config, t) for t in cfg.TIER_NAMES},
@@ -109,15 +113,19 @@ def describe_mode(config: dict[str, Any]) -> str:
                 else "loaded per decision"
             )
             lines.append(
-                f"  tier {tier}: {tier_labels[tier]} ({lifecycle}, gpu={bool(t.get('use_gpu'))})"
+                f"  D{tier}: {tier_labels[tier]} ({lifecycle}, gpu={bool(t.get('use_gpu'))})"
             )
         lines += [
-            "  tier 3: typesafe / " + config["jev"]["model"],
+            "  D3: typesafe / "
+            + config["jev"]["model"]
+            + (" (enabled)" if jev_enabled(config) else " (disabled; hard switch)"),
             "pruning:",
-            "  tier 0: deterministic (ANSI, duplicates and repetitive output)",
-            f"  tier 1: {tier_labels['1']}",
-            f"  tier 2: {tier_labels['2']}",
-            "  tier 3: typesafe / " + config["jev"]["model"],
+            "  P0: deterministic (ANSI, duplicates and repetitive output)",
+            f"  P1: {tier_labels['1']}",
+            f"  P2: {tier_labels['2']}",
+            "  P3: typesafe / "
+            + config["jev"]["model"]
+            + (" (enabled)" if jev_enabled(config) else " (disabled; hard switch)"),
             "  final fallback: native truncation",
             "JEV:",
             f"  {'dormant unless both local tiers fail' if jev_enabled(config) else jev_state + '; tier 3 dormant unless enabled after both local tiers fail'}",
@@ -975,16 +983,24 @@ def build_pruner(config: dict[str, Any]) -> Pruner:
                  local_judge(provider, timeout_s=settings.get("timeout_s")),
                  max_blocks=int(settings.get("max_blocks", 8)))
         )  # fmt: skip
-    jev = JevProvider.from_config(config)
+    key = load_key(config["jev"].get("key_file"))
+    literals = (key,) if key else ()
+    if jev_enabled(config):
+        jev = JevProvider.from_config(config)
+        jev_tier = Tier(3, "jev", config["jev"]["model"],
+                        jev_judge(jev, literals), max_blocks=int(pc.get("jev_max_blocks", 60)))  # fmt: skip
+    else:
+        # Retain an explicit skipped P3 receipt without constructing a network provider.
+        jev_tier = Tier(3, "jev", config["jev"]["model"], lambda *_: {},
+                        max_blocks=int(pc.get("jev_max_blocks", 60)))  # fmt: skip
     return Pruner(
         tiers,
-        Tier(3, "jev", config["jev"]["model"], jev_judge(jev, jev.secret_literals()),
-             max_blocks=int(pc.get("jev_max_blocks", 60))),
+        jev_tier,
         jev_enabled=jev_enabled(config),
         block_lines=int(pc.get("block_lines", 30)),
         hard_cap_factor=float(pc.get("hard_cap_factor", 2.0)),
         archive_dir=cfg.prune_archive_dir() if pc.get("archive", True) else None,
-        secret_literals=jev.secret_literals(),
+        secret_literals=literals,
     )  # fmt: skip
 
 
