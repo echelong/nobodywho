@@ -114,6 +114,7 @@ def describe_mode(config: dict[str, Any]) -> str:
         lines += [
             "  tier 3: typesafe / " + config["jev"]["model"],
             "pruning:",
+            "  tier 0: deterministic (ANSI, duplicates and repetitive output)",
             f"  tier 1: {tier_labels['1']}",
             f"  tier 2: {tier_labels['2']}",
             "  tier 3: typesafe / " + config["jev"]["model"],
@@ -737,12 +738,15 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
     for r in records:
         c = by_caller.setdefault(str(r.get("caller", "unknown")),
                                  {"calls": 0, "chars_in": 0, "chars_out": 0,
+                                  "untouched": 0, "deterministic": 0,
                                   "tier1_success": 0, "tier2_escalation": 0,
                                   "jev_fallback": 0, "native_truncation": 0,
                                   "latencies_ms": []})  # fmt: skip
         c["calls"] += 1
         c["chars_in"] += int(r.get("original_chars") or 0)
         c["chars_out"] += int(r.get("result_chars") or 0)
+        c["untouched"] += r.get("provider") == "none"
+        c["deterministic"] += r.get("provider") == "deterministic"
         raw_attempts = r.get("attempts")
         attempts: list[dict[str, Any]] = (
             [a for a in raw_attempts if isinstance(a, dict)]

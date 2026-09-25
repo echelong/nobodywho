@@ -210,7 +210,9 @@ failure never changes the command's exit status or stderr.
 
 Most of the work is deterministic: colour codes are removed, runs of identical lines keep one copy,
 every line is matched against the critical-line rules once, and repetitive progress is dropped
-without a model. A local tier is then asked about only the blocks that could still fit in the
+without a model. If that result fits the requested budget and retains every required fact, it
+returns immediately as `deterministic`, tier 0; no model worker starts. Otherwise a local tier is
+asked about only the blocks that could still fit in the
 budget, nearest the start and end of the output first (at most `max_blocks`, default 8), in **one
 prompt and one generation** that answers `keep` or `drop` per block. No samples are repeated and no
 text is generated. When the critical lines already fill the budget, no model is called.
@@ -236,12 +238,21 @@ Adapters differ in how reliably they reach the pruner:
 - **Claude, csmart (Opus)** use the `decision-prune` Claude plugin after every Bash call. Claude
   Code cuts a *failed* command's output to about 10k characters (head and tail) before a hook sees
   it, so the plugin prunes long successful output; long failing output stays Claude Code's cut.
-- **Codex 0.156.1** uses `adapters/codex/pre_tool_use.sh` in a trusted `PreToolUse`
-  hook. This release's `PostToolUse` cannot replace shell output. The hook passes
-  the original command as one quoted argument to `adapters/shared/decision-run-shell.bash`
-  in Codex's existing Bash process. The shared runner captures stdout, applies
-  the central threshold, and returns the real exit code.
-  The installed hook must be trusted in Codex's `/hooks` screen.
+- **Codex 0.156.1** uses native tool output handling by default. Its supported
+  `PreToolUse` rewrite requires `permissionDecision: "allow"`, which would change
+  command approval semantics. The old automatic plugin is disabled and its hook
+  returns `{}`. Use `decision prune --caller codex -- bash -c '...'` explicitly for
+  long build or test commands after normal Codex approval. The shared runner still
+  preserves the command's exit status and stderr.
+
+## Tev1 specialist status
+
+The official `togethercomputer/Tev1-4B-experimental` checkpoint is a Qwen3.5-4B
+fine-tune with a single-letter decision interface. The model card currently says
+the fine-tuned weight license is being finalized before public conversion; no
+official GGUF is published. Accordingly, this installation does not download,
+convert, activate, or distribute those weights. The generic NobodyWho decision
+tiers remain in place pending a clear license and a measured local benchmark.
 
 The one user config is `~/.config/decision-router/config.json`; all client adapters use the same
 router and append metadata-only receipts to `~/.local/state/decision-router/ledger.jsonl`. Original

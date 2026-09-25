@@ -46,32 +46,7 @@ def test_codex_hook_preserves_exact_shell_command(command, tmp_path):
         "tool_name": "Bash",
         "tool_input": {"cmd": command, "yield_time_ms": 1000},
     }
-    result = _codex_hook(payload)
-    updated = result["hookSpecificOutput"]["updatedInput"]
-    assert updated["yield_time_ms"] == 1000
-    assert "decision_run_shell " in updated["cmd"]
-    baseline = tmp_path / "baseline"
-    wrapped = tmp_path / "wrapped"
-    baseline.mkdir()
-    wrapped.mkdir()
-    original = subprocess.run(
-        ["/bin/bash", "-lc", command], cwd=baseline, capture_output=True, text=True, check=False
-    )
-    transformed = subprocess.run(
-        ["/bin/bash", "-lc", updated["cmd"]],
-        cwd=wrapped,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert (transformed.returncode, transformed.stdout, transformed.stderr) == (
-        original.returncode,
-        original.stdout,
-        original.stderr,
-    )
-    if (baseline / "result.txt").exists():
-        assert (wrapped / "result.txt").read_bytes() == (baseline / "result.txt").read_bytes()
-    assert _codex_hook({**payload, "tool_input": updated}) == {}
+    assert _codex_hook(payload) == {}
 
 
 def test_codex_runner_preserves_streams_exit_and_redirection(tmp_path):
@@ -212,8 +187,12 @@ def test_shared_threshold_skips_without_receipt(tmp_path):
 
 def test_runtime_dir_reuses_owned_login_session(monkeypatch):
     user_runtime = Path(f"/run/user/{os.getuid()}")
-    if not user_runtime.exists() or user_runtime.stat().st_uid != os.getuid():
-        pytest.skip("no owned login runtime directory")
+    if (
+        not user_runtime.exists()
+        or user_runtime.stat().st_uid != os.getuid()
+        or not os.access(user_runtime, os.W_OK)
+    ):
+        pytest.skip("no writable owned login runtime directory")
     monkeypatch.delenv("DECISION_ROUTER_RUNTIME_DIR", raising=False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     assert cfg.runtime_dir() == user_runtime / "decision-router"

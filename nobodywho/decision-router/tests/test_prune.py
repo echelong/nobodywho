@@ -79,6 +79,15 @@ def test_short_output_is_untouched_and_no_provider_runs():
     assert result.text == "ok\n" * 10 and result.provider == "none" and calls == []
 
 
+def test_deterministic_duplicate_fast_path_does_not_wake_model():
+    calls: list = []
+    output = "running\n" + "progress 5%\n" * 400 + "error: failed at src/main.rs:42\n"
+    result = pruner(judge_all(DROP, calls)).prune(PruneRequest(output=output, budget_chars=1000))
+    assert result.provider == "deterministic" and result.tier == 0
+    assert "error: failed at src/main.rs:42" in result.text
+    assert calls == []
+
+
 @pytest.mark.parametrize("name, command, output, must_keep", CASES, ids=[c[0] for c in CASES])
 def test_critical_facts_survive_even_if_every_block_is_dropped(name, command, output, must_keep):
     result = pruner(judge_all(DROP)).prune(

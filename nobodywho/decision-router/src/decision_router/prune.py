@@ -515,6 +515,24 @@ class Pruner:
 
         p = plan(request, self.block_lines, text=strip_ansi(original))
         archive = self._archive(request)
+        # Removing colour escapes, exact duplicate runs and routine progress frames
+        # needs no model judgement. Keep every other line in its original order.
+        keep_all = set(p.critical)
+        for block in p.blocks:
+            keep_all.update(range(*block))
+        deterministic = assemble(p.lines, keep_all, "decision prune (deterministic)")
+        if len(deterministic) <= request.budget_chars and not self._missing_required_facts(
+            p, deterministic
+        ):
+            text = self._finish(deterministic, archive, len(keep_all), p)
+            return self._done(
+                result(
+                    text=text, provider="deterministic", tier=0,
+                    kept_lines=len(keep_all),
+                    attempts=[{"tier": 0, "provider": "deterministic", "outcome": "accepted"}],
+                ),
+                started, len(keep_all),
+            )  # fmt: skip
         attempts: list[dict[str, Any]] = []
         chain = list(self.tiers)
         if self.jev is not None:
