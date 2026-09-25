@@ -776,6 +776,7 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
     providers: dict[str, int] = {}
     fallbacks: dict[str, int] = {}
     latencies: list[int] = []
+    route_latencies: dict[str, list[int]] = {}
     model_latencies: dict[str, list[int]] = {}
     for r in records:
         c = by_caller.setdefault(str(r.get("caller", "unknown")),
@@ -783,7 +784,7 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
                                   "untouched": 0, "deterministic": 0,
                                   "tier1_success": 0, "tier2_escalation": 0,
                                   "jev_fallback": 0, "native_truncation": 0,
-                                  "latencies_ms": []})  # fmt: skip
+                                  "latencies_ms": [], "route_latencies_ms": {}})  # fmt: skip
         c["calls"] += 1
         c["chars_in"] += int(r.get("original_chars") or 0)
         c["chars_out"] += int(r.get("result_chars") or 0)
@@ -811,19 +812,32 @@ def summarize_prunes(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(r.get("latency_ms"), int) and r.get("provider") not in ("none",):
             latencies.append(r["latency_ms"])
             c["latencies_ms"].append(r["latency_ms"])
+            c["route_latencies_ms"].setdefault(key, []).append(r["latency_ms"])
+            route_latencies.setdefault(key, []).append(r["latency_ms"])
             if r.get("model") and r.get("provider") == "nobodywho":
                 model_key = f"{r['provider']}/tier{r.get('tier')}/{r['model']}"
                 model_latencies.setdefault(model_key, []).append(r["latency_ms"])
     for c in by_caller.values():
         samples = sorted(c.pop("latencies_ms"))
-        c["median_latency_ms"] = samples[len(samples) // 2] if samples else None
+        per_route = c.pop("route_latencies_ms")
+        c["median_latency_ms"] = samples[len(samples) // 2] if len(per_route) == 1 else None
+        c["median_latency_ms_by_route"] = {
+            key: sorted(values)[len(values) // 2] for key, values in sorted(per_route.items())
+        }
     return {
         "calls": len(records),
         "by_caller": by_caller,
         "by_provider": providers,
         "fallback_reasons": fallbacks,
         "jev_used": sum(1 for r in records if r.get("jev_used")),
-        "median_latency_ms": sorted(latencies)[len(latencies) // 2] if latencies else None,
+        # The legacy scalar is meaningful only when every measured prune used
+        # the same route. P0 and model-backed calls must not share one median.
+        "median_latency_ms": (
+            sorted(latencies)[len(latencies) // 2] if len(route_latencies) == 1 else None
+        ),
+        "median_latency_ms_by_route": {
+            key: sorted(values)[len(values) // 2] for key, values in sorted(route_latencies.items())
+        },
         "median_latency_ms_by_model": {
             key: sorted(values)[len(values) // 2] for key, values in sorted(model_latencies.items())
         },

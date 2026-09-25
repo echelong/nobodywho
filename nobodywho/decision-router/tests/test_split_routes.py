@@ -158,3 +158,8 @@ def test_model_specific_stats_do_not_mix_routes():
     assert cli.summarize_prunes(prune)["median_latency_ms_by_model"] == {
         "nobodywho/tier1/Qwen_Qwen3-4B-Q4_K_M": 220,
     }
+    assert cli.summarize_prunes(prune)["median_latency_ms"] is None
+    assert cli.summarize_prunes(prune)["median_latency_ms_by_route"] == {
+        "deterministic/tier0": 5,
+        "nobodywho/tier1": 220,
+    }
