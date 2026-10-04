@@ -227,26 +227,39 @@ impl SamplerConfig {
     }
 
     pub fn build_sampler(&self, model: &LlamaModel) -> Result<LlamaSampler, SamplerError> {
-        self.build_sampler_with_prepended_step(model, None)
+        self.build_sampler_with_prepended_step(model, None, None)
+    }
+
+    /// [`Self::build_sampler`], but `factory` serves the config's grammar steps,
+    /// so a rebuild only compiles the grammar instead of walking the model's
+    /// vocabulary again. See [`GrammarFactory`].
+    pub(crate) fn build_sampler_with_factory(
+        &self,
+        model: &LlamaModel,
+        factory: &mut Option<GrammarFactory>,
+    ) -> Result<LlamaSampler, SamplerError> {
+        self.build_sampler_with_prepended_step(model, None, Some(factory))
     }
 
     /// Builds a sampler chain, optionally with an already-built grammar step
     /// prepended. The caller owns that step so it can reuse a [`GrammarFactory`]
-    /// across rebuilds instead of recompiling the grammar here.
+    /// across rebuilds instead of recompiling the grammar here. A
+    /// `grammar_factory` likewise lets the config's own grammar steps reuse a
+    /// held factory.
     pub(crate) fn build_sampler_with_prepended_step(
         &self,
         model: &LlamaModel,
         extra_step: Option<LlamaSampler>,
+        grammar_factory: Option<&mut Option<GrammarFactory>>,
     ) -> Result<LlamaSampler, SamplerError> {
         // Grammar steps go first, so they mask before anything truncates.
         let mut shift_steps = extra_step
             .into_iter()
             .map(Ok)
             .chain(
-                self.grammar_steps
-                    .iter()
-                    .cloned()
-                    .map(|step| self.build_grammar_step(model, step)),
+                self.build_grammar_steps(model, grammar_factory)?
+                    .into_iter()
+                    .map(Ok),
             )
             .chain(
                 self.steps
@@ -339,25 +352,55 @@ impl SamplerConfig {
         }
     }
 
+    /// Compiles every grammar step, in order, through `factory` when one is held.
+    fn build_grammar_steps(
+        &self,
+        model: &LlamaModel,
+        factory: Option<&mut Option<GrammarFactory>>,
+    ) -> Result<Vec<LlamaSampler>, SamplerError> {
+        let mut factory = factory;
+        let mut steps = Vec::with_capacity(self.grammar_steps.len());
+        for step in &self.grammar_steps {
+            let step_factory = factory.as_deref_mut();
+            steps.push(self.build_grammar_step(model, step.clone(), step_factory)?);
+        }
+        Ok(steps)
+    }
+
     fn build_grammar_step(
         &self,
         model: &LlamaModel,
         step: GrammarStep,
+        factory: Option<&mut Option<GrammarFactory>>,
     ) -> Result<LlamaSampler, SamplerError> {
-        match step {
+        let (tag, grammar, slices) = match step {
             // A schema always has JSON string bodies, so the slice pays for itself.
-            GrammarStep::JsonSchema(schema) => llguidance_sampler(
-                model,
+            GrammarStep::JsonSchema(schema) => (
                 "json_schema",
-                &schema,
-                &crate::tool_calling::json_body_slice_regexes(),
+                schema,
+                crate::tool_calling::json_body_slice_regexes(),
             ),
-            GrammarStep::Regex(pattern) => llguidance_sampler(model, "regex", &pattern, &[]),
-            GrammarStep::Lark(lark) => {
-                let lark = gbnf::gbnf_to_lark::any_to_lark(&lark)
-                    .map_err(|e| SamplerError::GbnfConversionError(e.to_string()))?;
-                llguidance_sampler(model, "lark", &lark, &[])
+            GrammarStep::Regex(pattern) => ("regex", pattern, Vec::new()),
+            GrammarStep::Lark(lark) => (
+                "lark",
+                gbnf::gbnf_to_lark::any_to_lark(&lark)
+                    .map_err(|e| SamplerError::GbnfConversionError(e.to_string()))?,
+                Vec::new(),
+            ),
+        };
+
+        match factory {
+            // Reuse the caller's factory: only its first build walks the vocabulary.
+            Some(held) => {
+                if let Some(rebuilt) = GrammarFactory::build_if_stale(held.as_ref(), model, slices)?
+                {
+                    *held = Some(rebuilt);
+                }
+                held.as_ref()
+                    .expect("`build_if_stale` returns None only when the held factory serves us")
+                    .grammar_step(tag, &grammar)
             }
+            None => llguidance_sampler(model, tag, &grammar, &slices),
         }
     }
 }

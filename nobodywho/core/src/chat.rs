@@ -2040,9 +2040,12 @@ impl ChatContext {
 ///
 /// `grammar_factory` carries the llguidance state between calls: the ~400ms init
 /// is paid on the first build and every later one only compiles the grammar.
+/// `user_grammar_factory` does the same for the user grammar steps the tool
+/// sampler chain embeds.
 fn build_tool_sampler(
     model: &llama_cpp_2::model::LlamaModel,
     grammar_factory: &mut Option<GrammarFactory>,
+    user_grammar_factory: &mut Option<GrammarFactory>,
     tools: &[Tool],
     sampler_config: &SamplerConfig,
     tool_format: Option<&ToolFormat>,
@@ -2066,8 +2069,11 @@ fn build_tool_sampler(
         .expect("`build_if_stale` returns None only when the held factory serves us");
 
     let grammar_step = factory.grammar_step("lark", &lark)?;
-    let tool_sampler =
-        sampler_config.build_sampler_with_prepended_step(model, Some(grammar_step))?;
+    let tool_sampler = sampler_config.build_sampler_with_prepended_step(
+        model,
+        Some(grammar_step),
+        Some(user_grammar_factory),
+    )?;
 
     let begin_tokens = model
         .vocab()
@@ -2203,7 +2209,11 @@ struct Chat<'a> {
     should_stop: Arc<AtomicBool>,
     tool_format: Option<ToolFormat>,
     sampler: ChatSampler,
+    /// llguidance state for the tool-call grammar (`tool_format`'s slices).
     grammar_factory: Option<GrammarFactory>,
+    /// llguidance state for user grammar steps, kept apart from the tool factory
+    /// because the two compile against different slice sets.
+    user_grammar_factory: Option<GrammarFactory>,
     sampler_config: SamplerConfig,
     messages: History,
     system_prompt: Option<String>,
@@ -2236,8 +2246,12 @@ impl<'a> Chat<'a> {
         };
 
         // Pre-build the base sampler for `sampler_config`, reused (via
-        // `ChatSampler`) for every response.
-        let base_sampler = sampler_config.build_sampler(&model.language_model)?;
+        // `ChatSampler`) for every response. The held factory makes later
+        // rebuilds (one per sample when the seed changes) skip the vocabulary
+        // walk.
+        let mut user_grammar_factory = None;
+        let base_sampler = sampler_config
+            .build_sampler_with_factory(&model.language_model, &mut user_grammar_factory)?;
 
         // Depends only on the model's chat template, not on `config.tools`,
         // so detect it once here regardless (cheap — see `tool_format` field
@@ -2258,6 +2272,7 @@ impl<'a> Chat<'a> {
         let tool_sampler = build_tool_sampler(
             &model.language_model,
             &mut grammar_factory,
+            &mut user_grammar_factory,
             &config.tools,
             &sampler_config,
             tool_format.as_ref(),
@@ -2280,6 +2295,7 @@ impl<'a> Chat<'a> {
             tool_format,
             sampler: ChatSampler::new(base_sampler, tool_sampler),
             grammar_factory,
+            user_grammar_factory,
             sampler_config,
             messages: History::default(),
             system_prompt: config.system_prompt,
@@ -2758,6 +2774,7 @@ impl<'a> Chat<'a> {
         let tool_sampler = build_tool_sampler(
             self.engine.ctx.model,
             &mut self.grammar_factory,
+            &mut self.user_grammar_factory,
             &tools,
             &self.sampler_config,
             self.tool_format.as_ref(),
@@ -2822,12 +2839,15 @@ impl<'a> Chat<'a> {
 
         // Run fallible functions before committing to state.
         let base_sampler = match &sampler_config {
-            Some(config) => Some(config.build_sampler(model)?),
+            Some(config) => {
+                Some(config.build_sampler_with_factory(model, &mut self.user_grammar_factory)?)
+            }
             None => None,
         };
         let tool_sampler = build_tool_sampler(
             model,
             &mut self.grammar_factory,
+            &mut self.user_grammar_factory,
             effective_tools,
             config,
             self.tool_format.as_ref(),
@@ -2931,7 +2951,7 @@ impl<'a> Chat<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sampler::SamplerPresets;
+    use crate::sampler::{GrammarStep, SampleStep, SamplerPresets, ShiftStep};
     use crate::test_utils;
 
     fn image_system_message() -> Message {
@@ -3431,6 +3451,58 @@ mod tests {
             after.contains("42.69"),
             "the tool was not called after the config change: {after}"
         );
+    }
+
+    /// A chat with no tools rebuilds its base sampler once per config change
+    /// (the router changes the seed per sample). Each rebuild must reuse the
+    /// held user factory and still enforce the grammar exactly.
+    #[test]
+    fn user_grammar_survives_a_sampler_config_change() {
+        let model = test_utils::load_test_model();
+        let mut worker = Chat::new_chat_worker(
+            &model,
+            ChatConfig {
+                n_ctx: 1024,
+                ..Default::default()
+            },
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("Failed making worker");
+
+        let ask = |worker: &mut Chat, prompt: &str| {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            worker
+                .ask(
+                    prompt.into(),
+                    text(move |x| {
+                        if let llm::WriteOutput::Done(resp) = x {
+                            sender.send(resp).unwrap();
+                        }
+                    }),
+                )
+                .expect("generation failed");
+            receiver.recv().unwrap()
+        };
+
+        for seed in [1, 2, 3] {
+            worker
+                .set_sampler_config(SamplerConfig::new(
+                    vec![GrammarStep::Lark("root ::= \"zqxjvkw\"".into())],
+                    vec![ShiftStep::TopK { top_k: 1 }],
+                    SampleStep::Dist,
+                    seed,
+                ))
+                .expect("setting a constrained sampler config");
+            assert!(
+                worker.user_grammar_factory.is_some(),
+                "the user grammar factory should be held after the first build"
+            );
+            assert_eq!(
+                ask(&mut worker, "Say hello."),
+                "zqxjvkw",
+                "a rebuilt constrained sampler must still enforce its grammar (seed {seed})"
+            );
+        }
     }
 
     #[test]
